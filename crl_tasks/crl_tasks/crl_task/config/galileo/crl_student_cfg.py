@@ -19,8 +19,7 @@ from .config_summary import ConfigSummary
 
 @configclass
 class GalileoStudentSceneCfg(GalileoCRLSceneCfg):
-    # Blind student: remove exteroceptive sensors.
-    height_scanner = None
+    # Student keeps height_scanner for critic (privileged); actor still remains blind.
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_link",
         history_length=2,
@@ -59,8 +58,8 @@ class GalileoStudentCRLEnvCfg(CRLManagerBasedRLEnvCfg):
         self.events.random_camera_position = None
         # ensure mass/com events target base_link
         self.events.randomize_base_mass.params["asset_cfg"].body_names = "base_link"
-        self.events.randomize_rigid_body_com.params["asset_cfg"].body_names = "base_link"
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = "base_link"
+        self.events.randomize_base_com.params["asset_cfg"].body_names = "base_link"
+        self.events.push_robot_torque.params["asset_cfg"].body_names = "base_link"
 
 
 @configclass

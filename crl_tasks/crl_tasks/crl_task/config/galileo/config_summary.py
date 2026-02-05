@@ -339,6 +339,16 @@ class ConfigSummary:
         resampling_time_range = (6.0, 6.0)
         clips = dict(lin_vel_clip=0.2, ang_vel_clip=0.3)
 
+    class priv_obs_norm:
+        """Normalization ranges for privileged observations."""
+        base_mass_delta_range = (-3.0, 5.0)
+        base_com_range = {
+            "x": (-0.05, 0.05),
+            "y": (-0.03, 0.03),
+            "z": (-0.03, 0.05),
+        }
+        ground_friction_range = (0.25, 1.2)
+
     class reward:
         class track_lin_vel_xy_exp:
             weight = 3.0

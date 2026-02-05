@@ -190,6 +190,8 @@ class ActorCriticRMA(nn.Module):
         self._encode_scan_for_critic = bool(kwargs.get("encode_scan_for_critic", False))
         self._num_prop = int(kwargs.get("num_prop", 0))
         self._num_scan = int(kwargs.get("num_scan", 0))
+        self._num_priv_explicit = int(kwargs.get("num_priv_explicit", 0))
+        self._num_priv_latent = int(kwargs.get("num_priv_latent", 0))
         
         # Critic：直接接收 num_critic_obs（可能含特权信息）
         if self._encode_scan_for_critic and self._num_scan > 0 and self.actor.scan_encoder_output_dim is not None:
@@ -285,6 +287,16 @@ class ActorCriticRMA(nn.Module):
     def act_inference(self, observations, hist_encoding=False, scandots_latent=None, **kwargs):
         actions_mean = self.actor(observations, hist_encoding, scandots_latent)
         return actions_mean
+
+    def act_student_inference(self, observations, zero_privileged: bool = True):
+        """Deployment helper for student policy: zero privileged terms and force history encoding."""
+        obs = observations
+        if zero_privileged and (self._num_priv_explicit + self._num_priv_latent) > 0:
+            obs = observations.clone()
+            start = self._num_prop + self._num_scan
+            end = start + self._num_priv_explicit + self._num_priv_latent
+            obs[:, start:end] = 0.0
+        return self.actor(obs, hist_encoding=True)
 
     def _encode_critic_obs(self, critic_observations: torch.Tensor) -> torch.Tensor:
         if not self._encode_scan_for_critic or self._num_scan <= 0:

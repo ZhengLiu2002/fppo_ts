@@ -70,6 +70,21 @@ Distillation = AlgoDistillation
 
 class OnPolicyRunnerWithExtractor(OnPolicyRunner):
     """纯算法训练 Runner，支持 PPO/FPPO/CPO/Distillation 等流程。"""
+    @staticmethod
+    def _expected_obs_dim(policy_cfg: dict) -> int | None:
+        num_prop = policy_cfg.get("num_prop", None)
+        if num_prop is None:
+            return None
+        try:
+            num_prop = int(num_prop)
+        except Exception:
+            return None
+        num_scan = int(policy_cfg.get("num_scan", 0) or 0)
+        num_priv_explicit = int(policy_cfg.get("num_priv_explicit", 0) or 0)
+        num_priv_latent = int(policy_cfg.get("num_priv_latent", 0) or 0)
+        num_hist = int(policy_cfg.get("num_hist", 0) or 0)
+        return num_prop + num_scan + num_priv_explicit + num_priv_latent + num_prop * num_hist
+
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -116,6 +131,17 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
+        expected_obs = self._expected_obs_dim(self.policy_cfg)
+        if expected_obs is not None and num_obs != expected_obs:
+            raise ValueError(
+                f"Policy obs dim mismatch: env provides {num_obs}, "
+                f"but policy_cfg expects {expected_obs} "
+                f"(num_prop={self.policy_cfg.get('num_prop')}, "
+                f"num_scan={self.policy_cfg.get('num_scan', 0)}, "
+                f"num_priv_explicit={self.policy_cfg.get('num_priv_explicit', 0)}, "
+                f"num_priv_latent={self.policy_cfg.get('num_priv_latent', 0)}, "
+                f"num_hist={self.policy_cfg.get('num_hist', 0)})."
+            )
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCriticRMA = policy_class(
                                              num_privileged_obs, self.env.num_actions, **self.policy_cfg

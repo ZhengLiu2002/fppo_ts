@@ -120,56 +120,6 @@ class ExtremeCRLObservations(ManagerTermBase):
         )
         return observations 
 
-
-class PolicyHistory(ManagerTermBase):
-    """History buffer for policy-proprioceptive features."""
-    def __init__(self, cfg: ObservationTermCfg, env: CRLManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self.history_length = int(cfg.params.get("history_length", 1))
-        self.include_base_lin_vel = bool(cfg.params.get("include_base_lin_vel", True))
-        self.command_name = cfg.params.get("command_name", "base_velocity")
-        self._obs_history_buffer = None
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        if self._obs_history_buffer is None:
-            return
-        if env_ids is None:
-            env_ids = slice(None)
-        self._obs_history_buffer[env_ids, :, :] = 0.0
-
-    def __call__(
-        self,
-        env: CRLManagerBasedRLEnv,
-        history_length: int,
-        include_base_lin_vel: bool,
-        command_name: str,
-    ) -> torch.Tensor:
-        hist_len = int(history_length)
-        prop_terms: list[torch.Tensor] = []
-        if include_base_lin_vel:
-            prop_terms.append(mdp.base_lin_vel(env))
-        prop_terms.extend(
-            [
-                mdp.base_ang_vel(env),
-                mdp.projected_gravity(env),
-                mdp.joint_pos_rel(env),
-                mdp.joint_vel_rel(env),
-                mdp.last_action(env),
-                mdp.generated_commands(env, command_name=command_name),
-            ]
-        )
-        prop = torch.cat(prop_terms, dim=-1)
-
-        if self._obs_history_buffer is None or self._obs_history_buffer.shape[1] != hist_len or self._obs_history_buffer.shape[2] != prop.shape[1]:
-            self._obs_history_buffer = torch.zeros(self.num_envs, hist_len, prop.shape[1], device=self.device)
-
-        self._obs_history_buffer = torch.where(
-            (env.episode_length_buf <= 1)[:, None, None],
-            torch.stack([prop] * hist_len, dim=1),
-            torch.cat([self._obs_history_buffer[:, 1:], prop.unsqueeze(1)], dim=1),
-        )
-        return self._obs_history_buffer.view(self.num_envs, -1)
-
     def _get_contact_fill(
         self,
         ):
@@ -225,6 +175,60 @@ class PolicyHistory(ManagerTermBase):
         default = torch.full((self.num_envs, 4), -1.0, device=self.device)
         heights = getattr(env.scene, "hurdle_heights", default)
         return heights
+
+
+class PolicyHistory(ManagerTermBase):
+    """History buffer for policy-proprioceptive features."""
+    def __init__(self, cfg: ObservationTermCfg, env: CRLManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.history_length = int(cfg.params.get("history_length", 1))
+        self.include_base_lin_vel = bool(cfg.params.get("include_base_lin_vel", True))
+        self.command_name = cfg.params.get("command_name", "base_velocity")
+        self._obs_history_buffer = None
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if self._obs_history_buffer is None:
+            return
+        if env_ids is None:
+            env_ids = slice(None)
+        self._obs_history_buffer[env_ids, :, :] = 0.0
+
+    def __call__(
+        self,
+        env: CRLManagerBasedRLEnv,
+        history_length: int,
+        include_base_lin_vel: bool,
+        command_name: str,
+    ) -> torch.Tensor:
+        hist_len = int(history_length)
+        prop_terms: list[torch.Tensor] = []
+        if include_base_lin_vel:
+            prop_terms.append(mdp.base_lin_vel(env))
+        prop_terms.extend(
+            [
+                mdp.base_ang_vel(env),
+                mdp.projected_gravity(env),
+                mdp.joint_pos_rel(env),
+                mdp.joint_vel_rel(env),
+                mdp.last_action(env),
+                mdp.generated_commands(env, command_name=command_name),
+            ]
+        )
+        prop = torch.cat(prop_terms, dim=-1)
+
+        if (
+            self._obs_history_buffer is None
+            or self._obs_history_buffer.shape[1] != hist_len
+            or self._obs_history_buffer.shape[2] != prop.shape[1]
+        ):
+            self._obs_history_buffer = torch.zeros(self.num_envs, hist_len, prop.shape[1], device=self.device)
+
+        self._obs_history_buffer = torch.where(
+            (env.episode_length_buf <= 1)[:, None, None],
+            torch.stack([prop] * hist_len, dim=1),
+            torch.cat([self._obs_history_buffer[:, 1:], prop.unsqueeze(1)], dim=1),
+        )
+        return self._obs_history_buffer.view(self.num_envs, -1)
 
 class image_features(ManagerTermBase):
     
@@ -334,30 +338,66 @@ def base_mass(
     env: CRLManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     body_name: str = "base_link",
+    normalize: bool = False,
+    mass_delta_range: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Return base body mass as (N, 1)."""
     asset: Articulation = env.scene[asset_cfg.name]
     body_id = _find_body_id(asset, body_name)
     masses = asset.root_physx_view.get_masses()[:, body_id].to(env.device)
-    return masses.unsqueeze(1)
+    masses = masses.unsqueeze(1)
+    if not normalize:
+        return masses
+    if mass_delta_range is None:
+        return masses
+    low, high = float(mass_delta_range[0]), float(mass_delta_range[1])
+    half_range = max(abs(low), abs(high), 1.0e-6)
+    default_masses = getattr(asset.data, "default_mass", None)
+    if default_masses is None:
+        ref = masses.mean()
+    else:
+        default_masses_t = torch.as_tensor(default_masses, device=env.device)
+        if default_masses_t.dim() == 1:
+            ref = default_masses_t[body_id]
+        else:
+            ref = default_masses_t[0, body_id]
+    delta = masses - ref
+    return torch.clamp(delta / half_range, -1.0, 1.0)
 
 
 def base_com(
     env: CRLManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     body_name: str = "base_link",
+    normalize: bool = False,
+    com_range: dict[str, tuple[float, float]] | None = None,
 ) -> torch.Tensor:
     """Return base body CoM (body frame) as (N, 3)."""
     asset: Articulation = env.scene[asset_cfg.name]
     body_id = _find_body_id(asset, body_name)
-    return asset.data.com_pos_b[:, body_id, :].to(env.device)
+    com = asset.data.com_pos_b[:, body_id, :].to(env.device)
+    if not normalize or com_range is None:
+        return com
+    ranges = [com_range.get(key, (0.0, 0.0)) for key in ("x", "y", "z")]
+    mins = torch.tensor([r[0] for r in ranges], device=env.device)
+    maxs = torch.tensor([r[1] for r in ranges], device=env.device)
+    mid = (mins + maxs) * 0.5
+    half = torch.clamp((maxs - mins) * 0.5, min=1.0e-6)
+    return torch.clamp((com - mid) / half, -1.0, 1.0)
 
 
 def ground_friction(
     env: CRLManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    normalize: bool = False,
+    friction_range: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Return ground friction coefficient as (N, 1)."""
     asset: Articulation = env.scene[asset_cfg.name]
-    friction = asset.root_physx_view.get_material_properties()[:, 0, 0].to(env.device)
-    return friction.unsqueeze(1)
+    friction = asset.root_physx_view.get_material_properties()[:, 0, 0].to(env.device).unsqueeze(1)
+    if not normalize or friction_range is None:
+        return friction
+    low, high = float(friction_range[0]), float(friction_range[1])
+    mid = (low + high) * 0.5
+    half = max((high - low) * 0.5, 1.0e-6)
+    return torch.clamp((friction - mid) / half, -1.0, 1.0)

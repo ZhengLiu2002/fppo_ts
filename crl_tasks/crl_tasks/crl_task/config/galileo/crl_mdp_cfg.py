@@ -86,9 +86,29 @@ class TeacherObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5}
         )
-        base_com = ObsTerm(func=crl_obs.base_com, params={"body_name": "base_link"})
-        base_mass = ObsTerm(func=crl_obs.base_mass, params={"body_name": "base_link"})
-        ground_friction = ObsTerm(func=crl_obs.ground_friction)
+        base_com = ObsTerm(
+            func=crl_obs.base_com,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "com_range": ConfigSummary.priv_obs_norm.base_com_range,
+            },
+        )
+        base_mass = ObsTerm(
+            func=crl_obs.base_mass,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "mass_delta_range": ConfigSummary.priv_obs_norm.base_mass_delta_range,
+            },
+        )
+        ground_friction = ObsTerm(
+            func=crl_obs.ground_friction,
+            params={
+                "normalize": True,
+                "friction_range": ConfigSummary.priv_obs_norm.ground_friction_range,
+            },
+        )
     @configclass
     class CriticCfg(ObsGroup):
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
@@ -103,9 +123,29 @@ class TeacherObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5}
         )
-        base_com = ObsTerm(func=crl_obs.base_com, params={"body_name": "base_link"})
-        base_mass = ObsTerm(func=crl_obs.base_mass, params={"body_name": "base_link"})
-        ground_friction = ObsTerm(func=crl_obs.ground_friction)
+        base_com = ObsTerm(
+            func=crl_obs.base_com,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "com_range": ConfigSummary.priv_obs_norm.base_com_range,
+            },
+        )
+        base_mass = ObsTerm(
+            func=crl_obs.base_mass,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "mass_delta_range": ConfigSummary.priv_obs_norm.base_mass_delta_range,
+            },
+        )
+        ground_friction = ObsTerm(
+            func=crl_obs.ground_friction,
+            params={
+                "normalize": True,
+                "friction_range": ConfigSummary.priv_obs_norm.ground_friction_range,
+            },
+        )
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -124,8 +164,22 @@ class StudentObservationsCfg:
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "base_velocity"}
         )
-        base_com = ObsTerm(func=crl_obs.base_com, params={"body_name": "base_link"})
-        base_mass = ObsTerm(func=crl_obs.base_mass, params={"body_name": "base_link"})
+        base_com = ObsTerm(
+            func=crl_obs.base_com,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "com_range": ConfigSummary.priv_obs_norm.base_com_range,
+            },
+        )
+        base_mass = ObsTerm(
+            func=crl_obs.base_mass,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "mass_delta_range": ConfigSummary.priv_obs_norm.base_mass_delta_range,
+            },
+        )
         history = ObsTerm(
             func=crl_obs.PolicyHistory,
             params={
@@ -135,7 +189,46 @@ class StudentObservationsCfg:
             },
         )
 
+    @configclass
+    class CriticCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        actions = ObsTerm(func=mdp.last_action)
+        velocity_commands = ObsTerm(
+            func=mdp.generated_commands, params={"command_name": "base_velocity"}
+        )
+        height_scan = ObsTerm(
+            func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5}
+        )
+        base_com = ObsTerm(
+            func=crl_obs.base_com,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "com_range": ConfigSummary.priv_obs_norm.base_com_range,
+            },
+        )
+        base_mass = ObsTerm(
+            func=crl_obs.base_mass,
+            params={
+                "body_name": "base_link",
+                "normalize": True,
+                "mass_delta_range": ConfigSummary.priv_obs_norm.base_mass_delta_range,
+            },
+        )
+        ground_friction = ObsTerm(
+            func=crl_obs.ground_friction,
+            params={
+                "normalize": True,
+                "friction_range": ConfigSummary.priv_obs_norm.ground_friction_range,
+            },
+        )
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
