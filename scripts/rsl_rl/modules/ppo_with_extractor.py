@@ -5,10 +5,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
-import math
 
 from .actor_critic_with_encoder import ActorCriticRMA
-from rsl_rl.algorithms import PPO
+from scripts.rsl_rl.algorithms import PPO
 
 class PPOWithExtractor(PPO):
     """带特权状态估计器与历史对齐正则的 PPO。"""
@@ -40,10 +39,8 @@ class PPOWithExtractor(PPO):
         # Distributed training parameters
         priv_reg_coef_schedual = [0, 0, 0],
         multi_gpu_cfg: dict | None = None,
-        # MoE/gating parameters
-        moe_aux_scales: dict | None = None,
-        moe_min_usage: float = 0.15,
-        gating_temperature_schedule: list[float] | tuple[float, float, float] | None = None,
+        # FPPO/CMDP extras (ignored for PPO)
+        **kwargs,
     ):
         super().__init__(
             policy, 
@@ -73,31 +70,23 @@ class PPOWithExtractor(PPO):
         print(f"estimator MLP: {estimator}")
 
         self.priv_states_dim = estimator_paras["num_priv_explicit"]
-        # The first num_priv_hurdles dims of priv_explicit are hurdle semantics for gating; never estimated.
         num_priv_hurdles = int(estimator_paras.get("num_priv_hurdles", 0))
-        if num_priv_hurdles <= 0 and hasattr(self.policy.actor, "gating_input_indices"):
-            num_priv_hurdles = len(getattr(self.policy.actor, "gating_input_indices"))
         self.num_priv_hurdles = num_priv_hurdles
         self.priv_states_dim_other = max(int(self.priv_states_dim) - int(self.num_priv_hurdles), 0)
         self.num_prop = estimator_paras["num_prop"]
         self.num_scan = estimator_paras["num_scan"]
-        self.estimator_optimizer = optim.Adam(self.estimator.parameters(), lr=estimator_paras["learning_rate"])
+        estimator_params = list(self.estimator.parameters())
+        self.estimator_optimizer = (
+            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"]) if estimator_params else None
+        )
         self.train_with_estimated_states = estimator_paras["train_with_estimated_states"]
-        self.hist_encoder_optimizer = optim.Adam(self.policy.actor.history_encoder.parameters(), lr=learning_rate)
+        hist_params = list(self.policy.actor.history_encoder.parameters())
+        self.hist_encoder_optimizer = (
+            optim.Adam(hist_params, lr=learning_rate) if len(hist_params) > 0 else None
+        )
         self.priv_reg_coef_schedual = priv_reg_coef_schedual
         self.counter = 0
-        # MoE/gating configs
-        self.moe_aux_scales = moe_aux_scales or {}
-        self.moe_aux_enabled = any(v != 0 for v in self.moe_aux_scales.values())
-        self.moe_min_usage = moe_min_usage
-        if gating_temperature_schedule is not None and len(gating_temperature_schedule) >= 3:
-            start_t, end_t, steps = gating_temperature_schedule[:3]
-            self.gating_temp_schedule = (float(start_t), float(end_t), max(float(steps), 1.0))
-            if hasattr(self.policy.actor, "gating_temperature"):
-                self.policy.actor.gating_temperature = float(start_t)
-        else:
-            self.gating_temp_schedule = None
-        self.last_gating_temperature = getattr(self.policy.actor, "gating_temperature", None)
+        # No MoE/gating in FPPO-TS
 
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, privileged_obs=None, actions_shape=None):
@@ -148,7 +137,7 @@ class PPOWithExtractor(PPO):
 
         return self.transition.actions
 
-    def process_env_step(self, obs, rewards, dones, extras):
+    def process_env_step(self, obs, rewards, dones, extras, costs=None):
         """收集环境一步数据，计算 RND、处理超时。"""
         obs_td = TensorDict({"obs": obs}, batch_size=[obs.shape[0]], device=self.device)
         # Update the normalizers
@@ -227,11 +216,6 @@ class PPOWithExtractor(PPO):
         mean_priv_reg_loss = 0
         mean_entropy = 0
         mean_estimator_loss = 0
-        mean_moe_aux_loss = 0
-        mean_gate_entropy = 0
-        mean_gate_min = 0
-        gate_batches = 0
-        gate_load_sum = None
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -248,8 +232,6 @@ class PPOWithExtractor(PPO):
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-
-        current_gating_temp = self._update_gating_temperature()
 
         # iterate over batches (handle both legacy and current rollout generators)
         for batch in generator:
@@ -302,7 +284,8 @@ class PPOWithExtractor(PPO):
 
             # zero grads for all optimizers before computing losses
             self.optimizer.zero_grad()
-            self.estimator_optimizer.zero_grad()
+            if self.estimator_optimizer is not None:
+                self.estimator_optimizer.zero_grad()
             if self.rnd_optimizer:
                 self.rnd_optimizer.zero_grad()
 
@@ -414,28 +397,6 @@ class PPOWithExtractor(PPO):
                 self.entropy_coef * entropy_batch.mean() + \
                 priv_reg_coef * priv_reg_loss
 
-            moe_aux_loss = None
-            if self.moe_aux_enabled:
-                gate_probs = self._compute_gate_probs(obs_batch)
-                if gate_probs is not None:
-                    loads = gate_probs.mean(dim=0)
-                    if gate_load_sum is None:
-                        gate_load_sum = loads.detach()
-                    else:
-                        gate_load_sum = gate_load_sum + loads.detach()
-                    target = 1.0 / gate_probs.shape[1]
-                    load_balance_loss = ((loads - target) ** 2).sum()
-                    entropy_loss = (-(gate_probs * torch.log(gate_probs + 1e-8)).sum(dim=-1)).mean()
-                    diversity_loss = torch.relu(self.moe_min_usage - loads.min())
-                    moe_aux_loss = (
-                        self.moe_aux_scales.get("balance", 0.0) * load_balance_loss
-                        + self.moe_aux_scales.get("entropy", 0.0) * entropy_loss
-                        + self.moe_aux_scales.get("diversity", 0.0) * diversity_loss
-                    )
-                    loss = loss + moe_aux_loss
-                    mean_gate_entropy += entropy_loss.detach().item()
-                    mean_gate_min += loads.min().detach().item()
-                    gate_batches += 1
 
             # Symmetry loss
             if self.symmetry:
@@ -484,7 +445,8 @@ class PPOWithExtractor(PPO):
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
 
-            estimator_loss.backward()
+            if self.estimator_optimizer is not None:
+                estimator_loss.backward()
             loss.backward()
 
             if self.rnd:
@@ -494,11 +456,13 @@ class PPOWithExtractor(PPO):
                 self.reduce_parameters()
 
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.estimator.parameters(), self.max_grad_norm)
+            if self.estimator_optimizer is not None:
+                nn.utils.clip_grad_norm_(self.estimator.parameters(), self.max_grad_norm)
             if self.rnd_optimizer:
                 nn.utils.clip_grad_norm_(self.rnd.predictor.parameters(), self.max_grad_norm)  # type: ignore
 
-            self.estimator_optimizer.step()
+            if self.estimator_optimizer is not None:
+                self.estimator_optimizer.step()
             self.optimizer.step()
 
             if self.rnd_optimizer:
@@ -509,8 +473,6 @@ class PPOWithExtractor(PPO):
             mean_entropy += entropy_batch.mean().item()
             mean_priv_reg_loss += priv_reg_loss.mean().item()
             mean_estimator_loss += estimator_loss.item()
-            if moe_aux_loss is not None:
-                mean_moe_aux_loss += moe_aux_loss.item()
 
             # -- RND loss
             if mean_rnd_loss is not None:
@@ -525,10 +487,6 @@ class PPOWithExtractor(PPO):
         mean_priv_reg_loss /= num_updates
         mean_entropy /= num_updates
         mean_estimator_loss /= num_updates
-        if self.moe_aux_enabled and gate_batches > 0:
-            mean_moe_aux_loss /= gate_batches
-            mean_gate_entropy /= gate_batches
-            mean_gate_min /= gate_batches
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         # -- For Symmetry
@@ -545,22 +503,6 @@ class PPOWithExtractor(PPO):
             'estimator':mean_estimator_loss,
             'priv_reg_coef': priv_reg_coef
         }
-        if self.moe_aux_enabled and gate_batches > 0:
-            loss_dict["moe_aux"] = mean_moe_aux_loss
-            loss_dict["gate_entropy"] = mean_gate_entropy
-            loss_dict["gate_min_usage"] = mean_gate_min
-            if gate_load_sum is not None:
-                mean_loads = gate_load_sum / gate_batches
-                expert_names = getattr(self.policy.actor, "expert_names", None)
-                for i in range(mean_loads.numel()):
-                    name = (
-                        expert_names[i]
-                        if expert_names is not None and i < len(expert_names)
-                        else f"expert_{i}"
-                    )
-                    loss_dict[f"gate_usage/{name}"] = mean_loads[i].item()
-            if current_gating_temp is not None:
-                loss_dict["gating_temperature"] = current_gating_temp
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -623,36 +565,14 @@ class PPOWithExtractor(PPO):
                 priv_latent_batch = self.policy.actor.infer_priv_latent(obs_batch)
             hist_latent_batch = self.policy.actor.infer_hist_latent(obs_batch)
             hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
-            self.hist_encoder_optimizer.zero_grad()
-            hist_latent_loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.actor.history_encoder.parameters(), self.max_grad_norm)
-            self.hist_encoder_optimizer.step()
+            if self.hist_encoder_optimizer is not None:
+                self.hist_encoder_optimizer.zero_grad()
+                hist_latent_loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.actor.history_encoder.parameters(), self.max_grad_norm)
+                self.hist_encoder_optimizer.step()
             mean_hist_latent_loss += hist_latent_loss.item()
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_hist_latent_loss /= num_updates
         self.storage.clear()
         self.update_counter()
         return mean_hist_latent_loss
-
-    def _compute_gate_probs(self, obs_batch: torch.Tensor) -> torch.Tensor | None:
-        """使用当前 batch 的特权显式段计算 gating 分布，支持反向传播。"""
-        actor = getattr(self.policy, "actor", None)
-        if actor is None or not hasattr(actor, "gating_input_indices"):
-            return None
-        start = actor.num_prop + actor.num_scan
-        end = start + actor.num_priv_explicit
-        obs_priv_explicit = obs_batch[:, start:end]
-        gate_feat = obs_priv_explicit[:, actor.gating_input_indices]
-        return actor._compute_gate(gate_feat)
-
-    def _update_gating_temperature(self) -> float | None:
-        """余弦退火 gating 温度：早期高温探索，后期低温聚焦。"""
-        if self.gating_temp_schedule is None or not hasattr(self.policy.actor, "gating_temperature"):
-            return getattr(self.policy.actor, "gating_temperature", None)
-        start_t, end_t, steps = self.gating_temp_schedule
-        progress = min(max(self.counter / steps, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        current_temp = end_t + (start_t - end_t) * cosine
-        self.policy.actor.gating_temperature = current_temp
-        self.last_gating_temperature = current_temp
-        return current_temp

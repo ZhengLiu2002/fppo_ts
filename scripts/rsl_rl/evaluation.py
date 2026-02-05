@@ -15,6 +15,9 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+_TASKS_ROOT = _REPO_ROOT / "crl_tasks"
+if _TASKS_ROOT.is_dir() and str(_TASKS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TASKS_ROOT))
 
 from isaaclab.app import AppLauncher
 from tqdm import tqdm
@@ -66,9 +69,9 @@ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from parkour_tasks.extreme_parkour_task.config.go2.agents.parkour_rl_cfg import ParkourRslRlOnPolicyRunnerCfg
+from crl_tasks.crl_task.config.galileo.agents.crl_rl_cfg import CRLRslRlOnPolicyRunnerCfg
 
-from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
+from scripts.rsl_rl.vecenv_wrapper import CRLRslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
@@ -87,7 +90,7 @@ def main():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
-    agent_cfg: ParkourRslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    agent_cfg: CRLRslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -125,7 +128,7 @@ def main():
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = CRLRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
@@ -134,19 +137,9 @@ def main():
     print(ppo_runner)
     # obtain the trained policy for inference
 
-    estimator = ppo_runner.get_estimator_inference_policy(device=env.device) 
-    if agent_cfg.algorithm.class_name == "DistillationWithExtractor":
-        policy = ppo_runner.get_inference_depth_policy(device=env.unwrapped.device)
-        depth_encoder = ppo_runner.get_depth_encoder_inference_policy(device=env.device)
-
-    else:
-        policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     dt = env.unwrapped.step_dt
-    estimator_paras = agent_cfg.to_dict()["estimator"]
-    num_prop = estimator_paras["num_prop"]
-    num_scan = estimator_paras["num_scan"]
-    num_priv_explicit = estimator_paras["num_priv_explicit"]
     # reset environment
     obs, extras = env.get_observations()
     timestep = 0
@@ -154,37 +147,16 @@ def main():
     total_steps = 1000
     rewbuffer = deque(maxlen=total_steps)
     lenbuffer = deque(maxlen=total_steps)
-    num_waypoints_buffer = deque(maxlen=total_steps)
-    edge_violation_buffer = deque(maxlen=total_steps)
     cur_reward_sum = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
     cur_episode_length = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
     cur_time_from_start = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
 
-    reward_feet_edge = env.unwrapped.reward_manager.get_term_cfg("reward_feet_edge").func
-    base_parkour = env.unwrapped.parkour_manager.get_term("base_parkour")
     # while simulation_app.is_running():
     for i in tqdm(range(1500)):
         start_time = time.time()
         # run everything in inference mode
-        if agent_cfg.algorithm.class_name != "DistillationWithExtractor":
-            with torch.inference_mode():
-                # agent stepping
-                # obs[:, num_prop+num_scan:num_prop+num_scan+num_priv_explicit] = estimator.inference(obs[:, :num_prop])
-                actions = policy(obs, hist_encoding = True)
-            # env stepping
-        else:
-            depth_camera = extras["observations"]['depth_camera'].to(env.device)
-            with torch.inference_mode():
-                if env.unwrapped.common_step_counter %5 == 0:
-                    obs_student = obs[:, :num_prop].clone()
-                    obs_student[:, 6:8] = 0
-                    depth_latent_and_yaw = depth_encoder(depth_camera, obs_student)
-                    depth_latent = depth_latent_and_yaw[:, :-2]
-                    yaw = depth_latent_and_yaw[:, -2:]
-                obs[:, 6:8] = 1.5*yaw
-                # obs[:, num_prop+num_scan:num_prop+num_scan+num_priv_explicit] = estimator.inference(obs[:, :num_prop])
-                actions = policy(obs, hist_encoding=True, scandots_latent=depth_latent)
-        cur_goal_idx = base_parkour.cur_goal_idx.clone()
+        with torch.inference_mode():
+            actions = policy(obs, hist_encoding=True)
         obs, rews, dones, extras = env.step(actions)
         if args_cli.video:
             timestep += 1
@@ -192,7 +164,6 @@ def main():
             if timestep == args_cli.video_length:
                 break
         
-        edge_violation_buffer.extend(reward_feet_edge.feet_at_edge.sum(dim=1).float().cpu().numpy().tolist())
         cur_reward_sum += rews
         cur_episode_length += 1
         cur_time_from_start += 1
@@ -200,7 +171,6 @@ def main():
         new_ids = (dones > 0).nonzero(as_tuple=False)
         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-        num_waypoints_buffer.extend(cur_goal_idx[new_ids][:, 0].cpu().numpy().tolist())
         cur_reward_sum[new_ids] = 0
 
         # time delay for real-time evaluation
@@ -216,16 +186,10 @@ def main():
     len_mean = statistics.mean(lenbuffer)
     len_std = statistics.stdev(lenbuffer)
 
-    num_waypoints_mean = np.mean(np.array(num_waypoints_buffer).astype(float)/7.0)
-    num_waypoints_std = np.std(np.array(num_waypoints_buffer).astype(float)/7.0)
 
-    edge_violation_mean = np.mean(edge_violation_buffer)
-    edge_violation_std = np.std(edge_violation_buffer)
 
     print("Mean reward: {:.2f}$\pm${:.2f}".format(rew_mean, rew_std))
     print("Mean episode length: {:.2f}$\pm${:.2f}".format(len_mean, len_std))
-    print("Mean number of waypoints: {:.2f}$\pm${:.2f}".format(num_waypoints_mean, num_waypoints_std))
-    print("Mean edge violation: {:.2f}$\pm${:.2f}".format(edge_violation_mean, edge_violation_std))
 
 if __name__ == "__main__":
     # run the main function

@@ -17,6 +17,9 @@ import pickle
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+_TASKS_ROOT = _REPO_ROOT / "crl_tasks"
+if _TASKS_ROOT.is_dir() and str(_TASKS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TASKS_ROOT))
 
 from isaaclab.app import AppLauncher
 
@@ -93,14 +96,14 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
-from parkour_tasks.extreme_parkour_task.config.go2.agents.parkour_rl_cfg import ParkourRslRlOnPolicyRunnerCfg
-from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
+from crl_tasks.crl_task.config.galileo.agents.crl_rl_cfg import CRLRslRlOnPolicyRunnerCfg
+from scripts.rsl_rl.vecenv_wrapper import CRLRslRlVecEnvWrapper
 # import isaaclab_tasks  # noqa: F401
-import parkour_tasks  # noqa: F401
+import crl_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from parkour_isaaclab.envs import (
-ParkourManagerBasedRLEnv
+from crl_isaaclab.envs import (
+CRLManagerBasedRLEnv
 )
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -122,7 +125,7 @@ def dump_pickle(filename: str, data: object):
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: ParkourRslRlOnPolicyRunnerCfg):
+def main(env_cfg: CRLManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: CRLRslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
     
 
@@ -152,12 +155,13 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: allow fixed name via env LOG_RUN_NAME, else {time-stamp}_{run_name}
+    # specify directory for logging runs: allow prefix via env LOG_RUN_NAME, always append time-stamp
     env_run = os.getenv("LOG_RUN_NAME", "").strip()
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if env_run:
-        log_dir = env_run
+        log_dir = f"{env_run}_{ts}"
     else:
-        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir = ts
         # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
         print(f"Exact experiment name requested from command line: {log_dir}")
     if agent_cfg.run_name:
@@ -172,7 +176,7 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         env = multi_agent_to_single_agent(env)
     
     # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "DistillationWithExtractor":
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # # wrap for video recording
@@ -188,13 +192,13 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = CRLRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     # # create runner from rsl-rl
     runner = OnPolicyRunnerWithExtractor(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     # # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "DistillationWithExtractor":
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)

@@ -1,0 +1,36 @@
+# === Python 自动生成 ===
+__pycache__/
+*.py[cod]
+*.class
+
+# === 编译与打包 ===
+*.egg-info/
+.eggs/
+dist/
+build/
+develop-eggs/
+lib/
+lib64/
+
+# === 训练日志与产物 (最占空间的部分) ===
+logs/
+outputs/
+videos/
+runs/
+*.tfevents*
+wandb/
+
+# === 模型权重文件 ===
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# === IDE 配置 ===
+.vscode/
+.idea/
+*.swp
+
+# === 其他 ===
+.DS_Store

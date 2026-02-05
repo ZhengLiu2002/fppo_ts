@@ -1,18 +1,24 @@
 from rsl_rl.env import VecEnv
-from parkour_isaaclab.envs import ParkourManagerBasedRLEnv
+from crl_isaaclab.envs import CRLManagerBasedRLEnv
 import gymnasium as gym
 import torch
 
-class ParkourRslRlVecEnvWrapper(VecEnv):
-    def __init__(self, env: ParkourManagerBasedRLEnv, clip_actions: float | None = None):
-        if not isinstance(env.unwrapped, ParkourManagerBasedRLEnv):
+class CRLRslRlVecEnvWrapper(VecEnv):
+    def __init__(
+        self,
+        env: CRLManagerBasedRLEnv,
+        clip_actions: float | None = None,
+        log_step_reward_terms: bool = False,
+    ):
+        if not isinstance(env.unwrapped, CRLManagerBasedRLEnv):
             raise ValueError(
-                "The environment must be inherited from ParkourManagerBasedRLEnv. Environment type:"
+                "The environment must be inherited from CRLManagerBasedRLEnv. Environment type:"
                 f" {type(env)}"
             )
         # initialize the wrapper
         self.env = env
         self.clip_actions = clip_actions
+        self.log_step_reward_terms = bool(log_step_reward_terms)
 
         # store information required by wrapper
         self.num_envs = self.unwrapped.num_envs
@@ -84,7 +90,7 @@ class ParkourRslRlVecEnvWrapper(VecEnv):
         return cls.__name__
 
     @property
-    def unwrapped(self) -> ParkourManagerBasedRLEnv:
+    def unwrapped(self) -> CRLManagerBasedRLEnv:
         """Returns the base environment of the wrapper.
 
         This will be the bare :class:`gymnasium.Env` environment, underneath all layers of wrappers.
@@ -141,6 +147,28 @@ class ParkourRslRlVecEnvWrapper(VecEnv):
         # move extra observations to the extras dict
         obs = obs_dict["policy"]
         extras["observations"] = obs_dict
+        # map IsaacLab-style log dict into RSL-RL episode dict for logging (copy to avoid aliasing)
+        log = extras.get("log")
+        if isinstance(log, dict):
+            log_for_episode = dict(log)
+            # Optional: attach step-wise reward term means (disabled by default to reduce log noise).
+            if self.log_step_reward_terms:
+                reward_manager = getattr(self.unwrapped, "reward_manager", None)
+                step_reward = getattr(reward_manager, "_step_reward", None)
+                term_names = getattr(reward_manager, "active_terms", None)
+                if torch.is_tensor(step_reward) and isinstance(term_names, list) and step_reward.ndim == 2:
+                    if step_reward.numel() > 0 and len(term_names) == step_reward.shape[1]:
+                        step_mean = step_reward.mean(dim=0).detach().cpu()
+                        for idx, name in enumerate(term_names):
+                            log_for_episode[f"Step_Reward/{name}"] = step_mean[idx]
+            # normalize tensors to cpu for logging
+            episode_log = {}
+            for key, value in log_for_episode.items():
+                if torch.is_tensor(value):
+                    episode_log[key] = value.detach().cpu()
+                else:
+                    episode_log[key] = value
+            extras["episode"] = episode_log
         # move time out information to the extras dict
         # this is only needed for infinite horizon tasks
         if not self.unwrapped.cfg.is_finite_horizon:

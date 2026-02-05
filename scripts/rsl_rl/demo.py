@@ -14,6 +14,9 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+_TASKS_ROOT = _REPO_ROOT / "crl_tasks"
+if _TASKS_ROOT.is_dir() and str(_TASKS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TASKS_ROOT))
 
 import cli_args  # isort: skip
 from isaaclab.app import AppLauncher
@@ -55,22 +58,22 @@ from omni.kit.viewport.utility.camera_state import ViewportCameraState
 from pxr import Gf, Sdf
 from scripts.rsl_rl.modules.on_policy_runner_with_extractor import OnPolicyRunnerWithExtractor
 
-from parkour_isaaclab.envs import (
-ParkourManagerBasedRLEnv
+from crl_isaaclab.envs import (
+CRLManagerBasedRLEnv
 )
 from isaaclab.utils.math import quat_apply
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
-from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
-from parkour_tasks.extreme_parkour_task.config.go2.agents.parkour_rl_cfg import ParkourRslRlOnPolicyRunnerCfg
+from scripts.rsl_rl.vecenv_wrapper import CRLRslRlVecEnvWrapper
+from crl_tasks.crl_task.config.galileo.agents.crl_rl_cfg import CRLRslRlOnPolicyRunnerCfg
+from crl_tasks.crl_task.config.galileo.crl_teacher_cfg import GalileoTeacherCRLEnvCfg_PLAY
+from crl_tasks.crl_task.config.galileo.crl_student_cfg import GalileoStudentCRLEnvCfg_PLAY
 
-from parkour_tasks.extreme_parkour_task.config.go2.parkour_teacher_cfg import UnitreeGo2TeacherParkourEnvCfg_PLAY
-from parkour_tasks.extreme_parkour_task.config.go2.parkour_student_cfg import UnitreeGo2StudentParkourEnvCfg_PLAY
 
-class ParkourDemoGO2:
+class CRLDemoGalileo:
     def __init__(self):
-        agent_cfg: ParkourRslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+        agent_cfg: CRLRslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
         log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
         log_root_path = os.path.abspath(log_root_path)
 
@@ -86,25 +89,19 @@ class ParkourDemoGO2:
 
         self.agent_cfg = agent_cfg 
         # create envionrment
-        env_cfg = UnitreeGo2TeacherParkourEnvCfg_PLAY() if agent_cfg.algorithm.class_name == 'PPOWithExtractor' else UnitreeGo2StudentParkourEnvCfg_PLAY()
+        env_cfg = GalileoTeacherCRLEnvCfg_PLAY() if "Teacher" in args_cli.task else GalileoStudentCRLEnvCfg_PLAY()
         env_cfg.scene.num_envs = args_cli.num_envs
         env_cfg.episode_length_s = 1000000
         env_cfg.curriculum = None
         self.env_cfg = env_cfg
         # wrap around environment for rsl-rl
-        self.env =  ParkourRslRlVecEnvWrapper(ParkourManagerBasedRLEnv(cfg=env_cfg))
+        self.env =  CRLRslRlVecEnvWrapper(CRLManagerBasedRLEnv(cfg=env_cfg))
         self.device = self.env.unwrapped.device
         # load previously trained model
         ppo_runner = OnPolicyRunnerWithExtractor(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
         ppo_runner.load(checkpoint)
         # obtain the trained policy for inference
-        self.estimator = ppo_runner.get_estimator_inference_policy(device=self.device)
-        if agent_cfg.algorithm.class_name == 'PPOWithExtractor':
-            self.policy = ppo_runner.get_inference_policy(device=self.device)
-            self.depth_encoder = None
-        else:
-            self.policy = ppo_runner.get_inference_depth_policy(device=self.device)
-            self.depth_encoder = ppo_runner.get_depth_encoder_inference_policy(device=self.device)
+        self.policy = ppo_runner.get_inference_policy(device=self.device)
 
 
         self.create_camera()
@@ -197,7 +194,7 @@ class ParkourDemoGO2:
                     self.viewport.set_active_camera(self.camera_path)
                 self._update_camera()
             else:
-                print("The selected prim was not a GO2 robot")
+                print("The selected prim was not a Galileo robot")
 
         # Reset commands for previously selected robot if a new one is selected
         if self._previous_selected_id is not None and self._previous_selected_id != self._selected_id:
@@ -221,36 +218,15 @@ class ParkourDemoGO2:
 
 def main():
     """Main function."""
-    demo_go2 = ParkourDemoGO2()
-    actor_param = demo_go2.agent_cfg.policy.actor
-    num_priv_explicit = actor_param.num_priv_explicit
-    num_priv_hurdles = int(getattr(actor_param, "num_priv_hurdles", 0))
-    num_scan = actor_param.num_scan
-    num_prop = actor_param.num_prop
-    obs, extras = demo_go2.env.reset()
+    demo_galileo = CRLDemoGalileo()
+    obs, extras = demo_galileo.env.reset()
     while simulation_app.is_running():
         # check for selected robots
-        demo_go2.update_selected_object()
+        demo_galileo.update_selected_object()
         with torch.inference_mode():
 
-            obs[:, 9] = demo_go2.commands[:,0]
-            if demo_go2.agent_cfg.algorithm.class_name != "DistillationWithExtractor":
-                priv_states_estimated = demo_go2.estimator.inference(obs[:, :num_prop])
-                if priv_states_estimated.numel() > 0:
-                    start = num_prop + num_scan + num_priv_hurdles
-                    end = num_prop + num_scan + num_priv_explicit
-                    obs[:, start:end] = priv_states_estimated
-                action = demo_go2.policy(obs)
-            else:
-                depth_camera = extras["observations"]['depth_camera'].to(demo_go2.device)
-                obs_student = obs[:, :num_prop].clone()
-                obs_student[:, 6:8] = 0
-                depth_latent_and_yaw = demo_go2.depth_encoder(depth_camera, obs_student)
-                depth_latent = depth_latent_and_yaw[:, :-2]
-                yaw = depth_latent_and_yaw[:, -2:]
-                obs[:, 6:8] = 1.5*yaw
-                action = demo_go2.policy(obs, hist_encoding=True, scandots_latent=depth_latent)
-            obs, _, _, extras = demo_go2.env.step(action)
+            action = demo_galileo.policy(obs, hist_encoding=True)
+            obs, _, _, extras = demo_galileo.env.step(action)
             # overwrite command based on keyboard input
 
 if __name__ == "__main__":

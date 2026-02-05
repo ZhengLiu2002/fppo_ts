@@ -59,14 +59,18 @@ class Actor(nn.Module):
             priv_encoder_output_dim = num_priv_latent
 
         state_history_encoder_cfg = kwargs.pop('state_history_encoder')
-        state_histroy_encoder_class = eval(state_history_encoder_cfg.pop('class_name'))
-        self.history_encoder: StateHistoryEncoder = state_histroy_encoder_class(
-                                                            activation, 
-                                                            num_prop, 
-                                                            num_hist, 
-                                                            priv_encoder_output_dim,
-                                                            state_history_encoder_cfg.pop('channel_size')
-                                                            )
+        if num_hist > 0:
+            state_histroy_encoder_class = eval(state_history_encoder_cfg.pop('class_name'))
+            self.history_encoder: StateHistoryEncoder = state_histroy_encoder_class(
+                activation,
+                num_prop,
+                num_hist,
+                priv_encoder_output_dim,
+                state_history_encoder_cfg.pop('channel_size')
+            )
+        else:
+            self.history_encoder = nn.Identity()
+        self._hist_latent_dim = priv_encoder_output_dim
         if self.if_scan_encode:
             scan_encoder = []
             scan_encoder.append(nn.Linear(num_scan, scan_encoder_dims[0]))
@@ -137,6 +141,8 @@ class Actor(nn.Module):
     
     def infer_hist_latent(self, obs):
         """对历史本体序列做 1D 卷积编码。"""
+        if self.num_hist <= 0:
+            return self.infer_priv_latent(obs)
         hist = obs[:, -self.num_hist*self.num_prop:]
         return self.history_encoder(hist.view(-1, self.num_hist, self.num_prop))
     
@@ -145,183 +151,6 @@ class Actor(nn.Module):
         scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
         return self.scan_encoder(scan)
 
-
-@register_actor("GatedMoEActor")
-class GatedMoEActor(nn.Module):
-    """多头 Actor：平稳/跳跃/钻爬专家头由 gating MLP 按特权特征软选择。"""
-    def __init__(
-        self,
-        num_actions,
-        scan_encoder_dims,
-        actor_hidden_dims,
-        priv_encoder_dims,
-        activation,
-        tanh_encoder_output=False,
-        gating_hidden_dims=None,
-        gating_temperature: float = 1.0,
-        gating_input_indices=None,
-        num_experts: int = 3,
-        gating_top_k: Optional[int] = None,
-        expert_names: Optional[List[str]] = None,
-        **kwargs,
-    ) -> None:
-        super().__init__()
-        self.num_prop = num_prop = kwargs.pop("num_prop")
-        self.num_scan = num_scan = kwargs.pop("num_scan")
-        self.num_hist = num_hist = kwargs.pop("num_hist")
-        self.num_actions = num_actions
-        self.num_priv_latent = num_priv_latent = kwargs.pop("num_priv_latent")
-        self.num_priv_explicit = num_priv_explicit = kwargs.pop("num_priv_explicit")
-        self.if_scan_encode = scan_encoder_dims is not None and num_scan > 0
-        self.in_features = num_prop + num_scan + num_priv_latent + num_priv_explicit + num_prop * num_hist
-
-        if len(priv_encoder_dims) > 0:
-            priv_encoder_layers = [nn.Linear(num_priv_latent, priv_encoder_dims[0]), activation]
-            for l in range(len(priv_encoder_dims) - 1):
-                priv_encoder_layers.append(nn.Linear(priv_encoder_dims[l], priv_encoder_dims[l + 1]))
-                priv_encoder_layers.append(activation)
-            self.priv_encoder = nn.Sequential(*priv_encoder_layers)
-            priv_encoder_output_dim = priv_encoder_dims[-1]
-        else:
-            self.priv_encoder = nn.Identity()
-            priv_encoder_output_dim = num_priv_latent
-
-        state_history_encoder_cfg = kwargs.pop("state_history_encoder")
-        state_histroy_encoder_class = eval(state_history_encoder_cfg.pop("class_name"))
-        self.history_encoder: StateHistoryEncoder = state_histroy_encoder_class(
-            activation,
-            num_prop,
-            num_hist,
-            priv_encoder_output_dim,
-            state_history_encoder_cfg.pop("channel_size"),
-        )
-        if self.if_scan_encode:
-            scan_encoder = [nn.Linear(num_scan, scan_encoder_dims[0]), activation]
-            for l in range(len(scan_encoder_dims) - 1):
-                if l == len(scan_encoder_dims) - 2:
-                    scan_encoder.append(nn.Linear(scan_encoder_dims[l], scan_encoder_dims[l + 1]))
-                    scan_encoder.append(nn.Tanh())
-                else:
-                    scan_encoder.append(nn.Linear(scan_encoder_dims[l], scan_encoder_dims[l + 1]))
-                    scan_encoder.append(activation)
-            self.scan_encoder = nn.Sequential(*scan_encoder)
-            self.scan_encoder_output_dim = scan_encoder_dims[-1]
-        else:
-            self.scan_encoder = nn.Identity()
-            self.scan_encoder_output_dim = num_scan
-
-        backbone_in_dim = (
-            num_prop + self.scan_encoder_output_dim + num_priv_explicit + priv_encoder_output_dim
-        )
-        def build_head():
-            layers = [nn.Linear(backbone_in_dim, actor_hidden_dims[0]), activation]
-            for l in range(len(actor_hidden_dims)):
-                if l == len(actor_hidden_dims) - 1:
-                    layers.append(nn.Linear(actor_hidden_dims[l], num_actions))
-                else:
-                    layers.append(nn.Linear(actor_hidden_dims[l], actor_hidden_dims[l + 1]))
-                    layers.append(activation)
-            if tanh_encoder_output:
-                layers.append(nn.Tanh())
-            return nn.Sequential(*layers)
-
-        # 专家列表：默认平稳/跳跃/钻爬三头；可扩展到任意 num_experts。
-        self.num_experts = max(int(num_experts), 2)
-        self.expert_names = expert_names or ["flat", "jump", "crawl"][: self.num_experts]
-        self.heads = nn.ModuleList([build_head() for _ in range(self.num_experts)])
-
-        gating_hidden_dims = gating_hidden_dims or [64, 64]
-        gate_layers = []
-        self.gating_input_indices = gating_input_indices or list(range(min(8, num_priv_explicit)))
-        gate_in = len(self.gating_input_indices)
-        gate_layers.append(nn.Linear(gate_in, gating_hidden_dims[0]))
-        gate_layers.append(activation)
-        for l in range(len(gating_hidden_dims) - 1):
-            gate_layers.append(nn.Linear(gating_hidden_dims[l], gating_hidden_dims[l + 1]))
-            gate_layers.append(activation)
-        gate_layers.append(nn.Linear(gating_hidden_dims[-1], self.num_experts))
-        self.gating_mlp = nn.Sequential(*gate_layers)
-        self.gating_temperature = gating_temperature
-        # TorchScript 友好：用 -1 表示未启用 top-k
-        self.gating_top_k = int(gating_top_k) if gating_top_k is not None else -1
-        # TorchScript 需要属性预先定义
-        self.gate_last = torch.zeros(1, self.num_experts)
-        self.gate_entropy = torch.zeros(1)
-        self.gate_logits_last = torch.zeros(1, self.num_experts)
-
-    def _split_inputs(
-        self, obs: torch.Tensor, scandots_latent: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """拆分观测为 (prop+scan_latent) 和 priv_explicit。"""
-        if self.if_scan_encode:
-            obs_scan = obs[:, self.num_prop : self.num_prop + self.num_scan]
-            scan_latent = self.scan_encoder(obs_scan) if scandots_latent is None else scandots_latent
-            obs_prop_scan = torch.cat([obs[:, : self.num_prop], scan_latent], dim=1)
-        else:
-            obs_prop_scan = obs[:, : self.num_prop + self.num_scan]
-        obs_priv_explicit = obs[:, self.num_prop + self.num_scan : self.num_prop + self.num_scan + self.num_priv_explicit]
-        return obs_prop_scan, obs_priv_explicit
-
-    def _latent(self, obs: torch.Tensor, hist_encoding: bool):
-        """根据标志选择历史编码或特权隐式编码。"""
-        if hist_encoding:
-            hist = obs[:, -self.num_hist * self.num_prop :]
-            return self.history_encoder(hist.view(-1, self.num_hist, self.num_prop))
-        priv = obs[:, self.num_prop + self.num_scan + self.num_priv_explicit : self.num_prop + self.num_scan + self.num_priv_explicit + self.num_priv_latent]
-        return self.priv_encoder(priv)
-
-    def _compute_gate(self, gate_feat: torch.Tensor) -> torch.Tensor:
-        """计算 gating 权重，可选 top-k 裁剪后做 softmax。"""
-        logits = self.gating_mlp(gate_feat)
-        self.gate_logits_last = logits.detach()
-        top_k = self.gating_top_k
-        if top_k >= 0 and top_k < self.num_experts:
-            topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
-            mask = torch.full_like(logits, float("-inf"))
-            mask.scatter_(1, topk_idx, topk_vals)
-            logits = mask
-        gate = torch.softmax(logits / max(self.gating_temperature, 1e-3), dim=-1)
-        return gate
-
-    def forward(self, obs: torch.Tensor, hist_encoding: bool, scandots_latent: Optional[torch.Tensor] = None):
-        """两头混合：
-        1) 编码输入 -> 共享特征
-        2) 分别经过 jump/crawl 头
-        3) 用 gating logits 软组合输出动作均值
-        """
-        obs_prop_scan, obs_priv_explicit = self._split_inputs(obs, scandots_latent)
-        latent = self._latent(obs, hist_encoding)
-        backbone_input = torch.cat([obs_prop_scan, obs_priv_explicit, latent], dim=1)
-
-        # 所有专家并行前向，再用门控权重混合
-        head_outputs = torch.stack([head(backbone_input) for head in self.heads], dim=1)
-
-        gate_feat = obs_priv_explicit[:, self.gating_input_indices]
-        gate = self._compute_gate(gate_feat)
-        # expose gate statistics for logging
-        self.gate_last = gate.detach()
-        self.gate_entropy = (-(gate * torch.log(gate + 1e-8)).sum(dim=-1)).detach()
-        mixed = torch.sum(gate.unsqueeze(-1) * head_outputs, dim=1)
-        return mixed
-
-    # keep parity with base Actor for downstream calls
-    def infer_priv_latent(self, obs):
-        priv = obs[:, self.num_prop + self.num_scan + self.num_priv_explicit : self.num_prop + self.num_scan + self.num_priv_explicit + self.num_priv_latent]
-        return self.priv_encoder(priv)
-
-    def infer_hist_latent(self, obs):
-        hist = obs[:, -self.num_hist * self.num_prop :]
-        return self.history_encoder(hist.view(-1, self.num_hist, self.num_prop))
-
-    def infer_scandots_latent(self, obs):
-        if not self.if_scan_encode:
-            return None
-        scan = obs[:, self.num_prop : self.num_prop + self.num_scan]
-        return self.scan_encoder(scan)
-
-
-# 兼容旧配置：沿用原类名以最小化外部改动
-ACTOR_REGISTRY["GatedDualHeadActor"] = GatedMoEActor
 
 class ActorCriticRMA(nn.Module):
     is_recurrent = False
@@ -332,6 +161,7 @@ class ActorCriticRMA(nn.Module):
         num_actions,
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
+        cost_critic_hidden_dims=None,
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
@@ -357,9 +187,15 @@ class ActorCriticRMA(nn.Module):
                                 tanh_encoder_output=kwargs['tanh_encoder_output'],
                                 **actor_cfg
                                 )
+        self._encode_scan_for_critic = bool(kwargs.get("encode_scan_for_critic", False))
+        self._num_prop = int(kwargs.get("num_prop", 0))
+        self._num_scan = int(kwargs.get("num_scan", 0))
         
         # Critic：直接接收 num_critic_obs（可能含特权信息）
-        mlp_input_dim_c = num_critic_obs
+        if self._encode_scan_for_critic and self._num_scan > 0 and self.actor.scan_encoder_output_dim is not None:
+            mlp_input_dim_c = num_critic_obs - self._num_scan + self.actor.scan_encoder_output_dim
+        else:
+            mlp_input_dim_c = num_critic_obs
         critic_layers = []
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
@@ -371,8 +207,24 @@ class ActorCriticRMA(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
+        # Cost critic (decoupled from reward critic)
+        cost_critic_hidden_dims = cost_critic_hidden_dims or critic_hidden_dims
+        cost_critic_layers = []
+        cost_critic_layers.append(nn.Linear(mlp_input_dim_c, cost_critic_hidden_dims[0]))
+        cost_critic_layers.append(activation)
+        for layer_index in range(len(cost_critic_hidden_dims)):
+            if layer_index == len(cost_critic_hidden_dims) - 1:
+                cost_critic_layers.append(nn.Linear(cost_critic_hidden_dims[layer_index], 1))
+            else:
+                cost_critic_layers.append(
+                    nn.Linear(cost_critic_hidden_dims[layer_index], cost_critic_hidden_dims[layer_index + 1])
+                )
+                cost_critic_layers.append(activation)
+        self.cost_critic = nn.Sequential(*cost_critic_layers)
+
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
+        print(f"Cost Critic MLP: {self.cost_critic}")
 
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
@@ -413,11 +265,14 @@ class ActorCriticRMA(nn.Module):
         """用最新 actor 输出均值并配合可学习方差构造高斯分布。"""
         mean = self.actor(observations, hist_encoding)
         if self.noise_std_type == "scalar":
-            std = mean*0. + self.std
+            std = mean * 0.0 + self.std
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # sanitize std to avoid NaN/Inf/negative values
+        std = torch.nan_to_num(std, nan=1.0e-6, posinf=1.0, neginf=1.0e-6)
+        std = torch.clamp(std, min=1.0e-6)
         self.distribution = Normal(mean, std)
 
     def act(self, observations, hist_encoding=False, **kwargs):
@@ -431,9 +286,29 @@ class ActorCriticRMA(nn.Module):
         actions_mean = self.actor(observations, hist_encoding, scandots_latent)
         return actions_mean
 
+    def _encode_critic_obs(self, critic_observations: torch.Tensor) -> torch.Tensor:
+        if not self._encode_scan_for_critic or self._num_scan <= 0:
+            return critic_observations
+        obs_scan = critic_observations[:, self._num_prop:self._num_prop + self._num_scan]
+        scan_latent = self.actor.scan_encoder(obs_scan)
+        return torch.cat(
+            [
+                critic_observations[:, :self._num_prop],
+                scan_latent,
+                critic_observations[:, self._num_prop + self._num_scan:],
+            ],
+            dim=1,
+        )
+
     def evaluate(self, critic_observations, **kwargs):
-        value = self.critic(critic_observations)
+        critic_input = self._encode_critic_obs(critic_observations)
+        value = self.critic(critic_input)
         return value
+
+    def evaluate_cost(self, critic_observations, **kwargs):
+        critic_input = self._encode_critic_obs(critic_observations)
+        cost_value = self.cost_critic(critic_input)
+        return cost_value
 
     def load_state_dict(self, state_dict, strict=True):
         super().load_state_dict(state_dict, strict=strict)

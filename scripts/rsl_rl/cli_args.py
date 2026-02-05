@@ -37,6 +37,21 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
     )
+    arg_group.add_argument(
+        "--algo",
+        type=str,
+        default=None,
+        choices={
+            "fppo",
+            "ppo",
+            "ppo_lagrange",
+            "cpo",
+            "pcpo",
+            "focpo",
+            "distillation",
+        },
+        help="Override algorithm class (for ablations).",
+    )
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlOnPolicyRunnerCfg:
@@ -87,5 +102,17 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
+
+    if hasattr(args_cli, "algo") and args_cli.algo is not None:
+        algo_map = {
+            "fppo": "FPPO",
+            "ppo": "PPO",
+            "ppo_lagrange": "PPOLagrange",
+            "cpo": "CPO",
+            "pcpo": "PCPO",
+            "focpo": "FOCPO",
+            "distillation": "Distillation",
+        }
+        agent_cfg.algorithm.class_name = algo_map[args_cli.algo]
 
     return agent_cfg

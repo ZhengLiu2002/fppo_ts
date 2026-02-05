@@ -38,7 +38,10 @@ class DistillationWithExtractor():
         self.num_prop = estimator_paras["num_prop"]
         self.num_scan = estimator_paras["num_scan"]
         self.policy = policy
-        self.estimator_optimizer = optim.Adam(self.estimator.parameters(), lr=estimator_paras["learning_rate"])
+        estimator_params = list(self.estimator.parameters())
+        self.estimator_optimizer = (
+            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"]) if estimator_params else None
+        )
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         self.rnd = None  # TODO: remove when runner has a proper base class
