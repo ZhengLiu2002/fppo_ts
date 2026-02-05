@@ -47,6 +47,12 @@ class CRLRslRlPpoActorCriticCfg(RslRlPpoActorCriticCfg):
     priv_encoder_dims: list[int] = MISSING
     cost_critic_hidden_dims: list[int] | None = None
     encode_scan_for_critic: bool = False
+    critic_scan_encoder_dims: list[int] | None = None
+    critic_num_prop: int | None = None
+    critic_num_scan: int | None = None
+    critic_num_priv_explicit: int | None = None
+    critic_num_priv_latent: int | None = None
+    critic_num_hist: int | None = None
     actor: CRLRslRlActorCfg = MISSING
 
 @configclass

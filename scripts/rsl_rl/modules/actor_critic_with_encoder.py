@@ -192,10 +192,37 @@ class ActorCriticRMA(nn.Module):
         self._num_scan = int(kwargs.get("num_scan", 0))
         self._num_priv_explicit = int(kwargs.get("num_priv_explicit", 0))
         self._num_priv_latent = int(kwargs.get("num_priv_latent", 0))
+        self._critic_num_prop = int(kwargs.get("critic_num_prop", self._num_prop) or self._num_prop)
+        self._critic_num_scan = int(kwargs.get("critic_num_scan", self._num_scan) or self._num_scan)
+        self._critic_num_priv_explicit = int(
+            kwargs.get("critic_num_priv_explicit", self._num_priv_explicit) or self._num_priv_explicit
+        )
+        self._critic_num_priv_latent = int(
+            kwargs.get("critic_num_priv_latent", self._num_priv_latent) or self._num_priv_latent
+        )
+        self._critic_num_hist = int(kwargs.get("critic_num_hist", 0) or 0)
+        critic_scan_encoder_dims = kwargs.get("critic_scan_encoder_dims", None)
+        self._critic_scan_encoder = None
+        self._critic_scan_encoder_output_dim = self._critic_num_scan
+        if self._encode_scan_for_critic and self._critic_num_scan > 0 and critic_scan_encoder_dims:
+            scan_encoder = []
+            scan_encoder.append(nn.Linear(self._critic_num_scan, critic_scan_encoder_dims[0]))
+            scan_encoder.append(activation)
+            for l in range(len(critic_scan_encoder_dims) - 1):
+                if l == len(critic_scan_encoder_dims) - 2:
+                    scan_encoder.append(nn.Linear(critic_scan_encoder_dims[l], critic_scan_encoder_dims[l+1]))
+                    scan_encoder.append(nn.Tanh())
+                else:
+                    scan_encoder.append(nn.Linear(critic_scan_encoder_dims[l], critic_scan_encoder_dims[l + 1]))
+                    scan_encoder.append(activation)
+            self._critic_scan_encoder = nn.Sequential(*scan_encoder)
+            self._critic_scan_encoder_output_dim = critic_scan_encoder_dims[-1]
+        elif self._encode_scan_for_critic and self._critic_num_scan > 0:
+            self._critic_scan_encoder_output_dim = self.actor.scan_encoder_output_dim
         
         # Critic：直接接收 num_critic_obs（可能含特权信息）
-        if self._encode_scan_for_critic and self._num_scan > 0 and self.actor.scan_encoder_output_dim is not None:
-            mlp_input_dim_c = num_critic_obs - self._num_scan + self.actor.scan_encoder_output_dim
+        if self._encode_scan_for_critic and self._critic_num_scan > 0:
+            mlp_input_dim_c = num_critic_obs - self._critic_num_scan + self._critic_scan_encoder_output_dim
         else:
             mlp_input_dim_c = num_critic_obs
         critic_layers = []
@@ -299,15 +326,18 @@ class ActorCriticRMA(nn.Module):
         return self.actor(obs, hist_encoding=True)
 
     def _encode_critic_obs(self, critic_observations: torch.Tensor) -> torch.Tensor:
-        if not self._encode_scan_for_critic or self._num_scan <= 0:
+        if not self._encode_scan_for_critic or self._critic_num_scan <= 0:
             return critic_observations
-        obs_scan = critic_observations[:, self._num_prop:self._num_prop + self._num_scan]
-        scan_latent = self.actor.scan_encoder(obs_scan)
+        obs_scan = critic_observations[:, self._critic_num_prop:self._critic_num_prop + self._critic_num_scan]
+        if self._critic_scan_encoder is not None:
+            scan_latent = self._critic_scan_encoder(obs_scan)
+        else:
+            scan_latent = self.actor.scan_encoder(obs_scan)
         return torch.cat(
             [
-                critic_observations[:, :self._num_prop],
+                critic_observations[:, :self._critic_num_prop],
                 scan_latent,
-                critic_observations[:, self._num_prop + self._num_scan:],
+                critic_observations[:, self._critic_num_prop + self._critic_num_scan:],
             ],
             dim=1,
         )

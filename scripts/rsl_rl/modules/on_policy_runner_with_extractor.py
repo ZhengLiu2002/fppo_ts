@@ -142,6 +142,25 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 f"num_priv_latent={self.policy_cfg.get('num_priv_latent', 0)}, "
                 f"num_hist={self.policy_cfg.get('num_hist', 0)})."
             )
+        expected_critic = self._expected_obs_dim(
+            {
+                "num_prop": self.policy_cfg.get("critic_num_prop"),
+                "num_scan": self.policy_cfg.get("critic_num_scan", 0),
+                "num_priv_explicit": self.policy_cfg.get("critic_num_priv_explicit", 0),
+                "num_priv_latent": self.policy_cfg.get("critic_num_priv_latent", 0),
+                "num_hist": self.policy_cfg.get("critic_num_hist", 0),
+            }
+        )
+        if expected_critic is not None and self.privileged_obs_type is not None and num_privileged_obs != expected_critic:
+            raise ValueError(
+                f"Critic obs dim mismatch: env provides {num_privileged_obs}, "
+                f"but policy_cfg expects {expected_critic} "
+                f"(critic_num_prop={self.policy_cfg.get('critic_num_prop')}, "
+                f"critic_num_scan={self.policy_cfg.get('critic_num_scan', 0)}, "
+                f"critic_num_priv_explicit={self.policy_cfg.get('critic_num_priv_explicit', 0)}, "
+                f"critic_num_priv_latent={self.policy_cfg.get('critic_num_priv_latent', 0)}, "
+                f"critic_num_hist={self.policy_cfg.get('critic_num_hist', 0)})."
+            )
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCriticRMA = policy_class(
                                              num_privileged_obs, self.env.num_actions, **self.policy_cfg
