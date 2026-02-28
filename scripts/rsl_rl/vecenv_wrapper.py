@@ -3,6 +3,7 @@ from crl_isaaclab.envs import CRLManagerBasedRLEnv
 import gymnasium as gym
 import torch
 
+
 class CRLRslRlVecEnvWrapper(VecEnv):
     def __init__(
         self,
@@ -40,8 +41,13 @@ class CRLRslRlVecEnvWrapper(VecEnv):
             and "critic" in self.unwrapped.observation_manager.group_obs_dim
         ):
             self.num_privileged_obs = self.unwrapped.observation_manager.group_obs_dim["critic"][0]
-        elif hasattr(self.unwrapped, "num_states") and "critic" in self.unwrapped.single_observation_space:
-            self.num_privileged_obs = gym.spaces.flatdim(self.unwrapped.single_observation_space["critic"])
+        elif (
+            hasattr(self.unwrapped, "num_states")
+            and "critic" in self.unwrapped.single_observation_space
+        ):
+            self.num_privileged_obs = gym.spaces.flatdim(
+                self.unwrapped.single_observation_space["critic"]
+            )
         else:
             self.num_privileged_obs = 0
 
@@ -50,7 +56,6 @@ class CRLRslRlVecEnvWrapper(VecEnv):
 
         # reset at the start since the RSL-RL runner does not call reset
         self.env.reset()
-
 
     def __str__(self):
         """Returns the wrapper name and the :attr:`env` representation string."""
@@ -156,7 +161,11 @@ class CRLRslRlVecEnvWrapper(VecEnv):
                 reward_manager = getattr(self.unwrapped, "reward_manager", None)
                 step_reward = getattr(reward_manager, "_step_reward", None)
                 term_names = getattr(reward_manager, "active_terms", None)
-                if torch.is_tensor(step_reward) and isinstance(term_names, list) and step_reward.ndim == 2:
+                if (
+                    torch.is_tensor(step_reward)
+                    and isinstance(term_names, list)
+                    and step_reward.ndim == 2
+                ):
                     if step_reward.numel() > 0 and len(term_names) == step_reward.shape[1]:
                         step_mean = step_reward.mean(dim=0).detach().cpu()
                         for idx, name in enumerate(term_names):

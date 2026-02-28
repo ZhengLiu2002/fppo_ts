@@ -1,38 +1,38 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""RSL-RL policy and algorithm configuration for Galileo CRL tasks."""
 
 from __future__ import annotations
 
 from dataclasses import MISSING
-from isaaclab.utils import configclass
 
+from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
-RslRlOnPolicyRunnerCfg, 
-RslRlPpoActorCriticCfg, 
-RslRlPpoAlgorithmCfg,
+    RslRlOnPolicyRunnerCfg,
+    RslRlPpoActorCriticCfg,
+    RslRlPpoAlgorithmCfg,
 )
-#########################
-# Policy configurations #
-#########################
+
 
 @configclass
 class CRLRslRlBaseCfg:
-    # FPPO-style observation layout: base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
-    # + joint_pos(12) + joint_vel(12) + actions(12) + commands(3) + height_scan(132) = 180
+    """Shared observation layout for FPPO-style policies."""
+
+    # base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
+    # + joint_pos(12) + joint_vel(12) + actions(12) + commands(3)
+    # + height_scan(132) = 180
     num_priv_hurdles: int = 0
     num_priv_explicit: int = 0
     num_priv_latent: int = 0
     num_prop: int = 180
     num_scan: int = 0
     num_hist: int = 0
-    
+
+
 @configclass
 class CRLRslRlStateHistEncoderCfg(CRLRslRlBaseCfg):
-    class_name: str = "StateHistoryEncoder" 
-    channel_size: int = 10 
-    
+    class_name: str = "StateHistoryEncoder"
+    channel_size: int = 10
+
+
 @configclass
 class CRLRslRlActorCfg(CRLRslRlBaseCfg):
     class_name: str = "Actor"
@@ -41,8 +41,13 @@ class CRLRslRlActorCfg(CRLRslRlBaseCfg):
 
 @configclass
 class CRLRslRlPpoActorCriticCfg(RslRlPpoActorCriticCfg):
-    class_name: str = 'ActorCriticRMA'
-    tanh_encoder_output: bool = False 
+    class_name: str = "ActorCriticRMA"
+    num_prop: int = MISSING
+    num_scan: int = 0
+    num_priv_explicit: int = 0
+    num_priv_latent: int = 0
+    num_hist: int = 0
+    tanh_encoder_output: bool = False
     scan_encoder_dims: list[int] = MISSING
     priv_encoder_dims: list[int] = MISSING
     cost_critic_hidden_dims: list[int] | None = None
@@ -55,11 +60,13 @@ class CRLRslRlPpoActorCriticCfg(RslRlPpoActorCriticCfg):
     critic_num_hist: int | None = None
     actor: CRLRslRlActorCfg = MISSING
 
+
 @configclass
 class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "FPPO"
     dagger_update_freq: int = 1
-    priv_reg_coef_schedual: list[float]= [0, 0.1, 2000, 3000]
+    priv_reg_coef_schedual: list[float] = [0, 0.1, 2000, 3000]
+
     # FPPO/CMDP extensions
     cost_value_loss_coef: float = 1.0
     step_size: float = 1e-3
@@ -86,12 +93,30 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     preconditioner_eps: float = 1e-8
     feasible_first: bool = True
     feasible_first_coef: float = 1.0
+    # NP3O-style positive-part cost shaping (shared across constrained algorithms)
+    cost_viol_loss_coef: float = 0.0
+    k_value: float = 1.0
+    k_growth: float = 1.0
+    k_max: float = 1.0
+
 
 @configclass
 class CRLRslRlDistillationAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "Distillation"
 
+
 @configclass
 class CRLRslRlOnPolicyRunnerCfg(RslRlOnPolicyRunnerCfg):
     policy: CRLRslRlPpoActorCriticCfg = MISSING
     algorithm: CRLRslRlPpoAlgorithmCfg | CRLRslRlDistillationAlgorithmCfg = MISSING
+
+
+__all__ = [
+    "CRLRslRlBaseCfg",
+    "CRLRslRlStateHistEncoderCfg",
+    "CRLRslRlActorCfg",
+    "CRLRslRlPpoActorCriticCfg",
+    "CRLRslRlPpoAlgorithmCfg",
+    "CRLRslRlDistillationAlgorithmCfg",
+    "CRLRslRlOnPolicyRunnerCfg",
+]

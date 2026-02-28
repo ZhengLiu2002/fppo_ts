@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import copy
@@ -8,18 +7,25 @@ from typing import TYPE_CHECKING
 import omni.kit.app
 import omni.timeline
 import carb
-from isaaclab.envs.ui import ViewportCameraController 
+from isaaclab.envs.ui import ViewportCameraController
+
+try:
+    import omni.appwindow as _omni_appwindow
+except ModuleNotFoundError:
+    _omni_appwindow = None
 
 if TYPE_CHECKING:
-    from crl_isaaclab.envs import  CRLManagerBasedEnv
+    from crl_isaaclab.envs import CRLManagerBasedEnv
     from isaaclab.envs import ViewerCfg
+
 
 class CRLViewportCameraController(ViewportCameraController):
     """
-    Viewport Camera Controller with Keyboard 
-    reference: 
+    Viewport Camera Controller with Keyboard
+    reference:
         https://docs.omniverse.nvidia.com/dev-guide/latest/programmer_ref/input-devices/keyboard.html
     """
+
     def __init__(self, env: CRLManagerBasedEnv, cfg: ViewerCfg):
         self._env = env
         self._cfg = copy.deepcopy(cfg)
@@ -39,24 +45,48 @@ class CRLViewportCameraController(ViewportCameraController):
             # in the scene when this is called. Instead, we subscribe to the post update event to update the camera
             # at each rendering step.
             if self.cfg.asset_name is None:
-                raise ValueError(f"No asset name provided for viewer with origin type: '{self.cfg.origin_type}'.")
+                raise ValueError(
+                    f"No asset name provided for viewer with origin type: '{self.cfg.origin_type}'."
+                )
             if self.cfg.origin_type == "asset_body":
                 if self.cfg.body_name is None:
-                    raise ValueError(f"No body name provided for viewer with origin type: '{self.cfg.origin_type}'.")
+                    raise ValueError(
+                        f"No body name provided for viewer with origin type: '{self.cfg.origin_type}'."
+                    )
         else:
             # set the camera origin to the center of the world
             self.update_view_to_world()
 
-        self._appwindow = omni.appwindow.get_default_app_window()
+        self._appwindow = (
+            _omni_appwindow.get_default_app_window() if _omni_appwindow is not None else None
+        )
         self._input = carb.input.acquire_input_interface()
-        self._keyboard = self._appwindow.get_keyboard()
-        self.free_cam_trigger = False 
+        self._keyboard = None
+        self._keyboard_sub = None
+        self.free_cam_trigger = False
         self.is_free_cam = False
 
-        self._keyboard_sub = self._input.subscribe_to_keyboard_events(
-            self._keyboard,
-            lambda event, *args, obj=weakref.proxy(self): obj._on_keyboard_event(event, *args),
-        )
+        # In some play/offscreen modes, a viewport camera exists but no GUI app window is created.
+        # Degrade gracefully: keep camera tracking callbacks, disable keyboard controls.
+        if self._appwindow is not None:
+            self._keyboard = self._appwindow.get_keyboard()
+            if self._keyboard is not None:
+                self._keyboard_sub = self._input.subscribe_to_keyboard_events(
+                    self._keyboard,
+                    lambda event, *args, obj=weakref.proxy(self): obj._on_keyboard_event(
+                        event, *args
+                    ),
+                )
+            else:
+                carb.log_warn(
+                    "CRLViewportCameraController: app window has no keyboard handle."
+                    " Keyboard camera controls are disabled."
+                )
+        else:
+            carb.log_warn(
+                "CRLViewportCameraController: no app window detected."
+                " Keyboard camera controls are disabled."
+            )
         # self._mouse = self._appwindow.get_mouse()
         # subscribe to post update event so that camera view can be updated at each rendering step
         app_interface = omni.kit.app.get_app_interface()
@@ -67,52 +97,79 @@ class CRLViewportCameraController(ViewportCameraController):
 
     def __del__(self):
         """Release the keyboard interface."""
-        self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
-        self._keyboard_sub = None
+        if (
+            hasattr(self, "_input")
+            and self._input is not None
+            and hasattr(self, "_keyboard")
+            and self._keyboard is not None
+            and hasattr(self, "_keyboard_sub")
+            and self._keyboard_sub is not None
+        ):
+            self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
+            self._keyboard_sub = None
+        if (
+            hasattr(self, "_viewport_camera_update_handle")
+            and self._viewport_camera_update_handle is not None
+        ):
+            self._viewport_camera_update_handle.unsubscribe()
+            self._viewport_camera_update_handle = None
 
     def _on_keyboard_event(self, event, *args, **kwargs):
         # apply the command when pressed
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input.name == "NUMPAD_7" and not self.is_free_cam:
-                self.cfg.env_index  = (self.cfg.env_index - 1) % self._env.num_envs
+                self.cfg.env_index = (self.cfg.env_index - 1) % self._env.num_envs
 
             elif event.input.name in "NUMPAD_9" and not self.is_free_cam:
                 self.cfg.env_index = (self.cfg.env_index + 1) % self._env.num_envs
-        
+
             elif event.input.name in "NUMPAD_8" and not self.is_free_cam:
                 self.default_cam_eye[0] += 0.2
 
             elif event.input.name in "NUMPAD_4" and not self.is_free_cam:
                 self.default_cam_eye[1] += 0.2
-        
+
             elif event.input.name in "NUMPAD_6" and not self.is_free_cam:
                 self.default_cam_eye[2] += 0.2
-        
+
             elif event.input.name in "NUMPAD_5" and not self.is_free_cam:
                 self.default_cam_eye[0] -= 0.2
 
             elif event.input.name in "NUMPAD_2" and not self.is_free_cam:
                 self.default_cam_eye[:] = self._cfg.eye
-            
+
             if event.input.name in "NUMPAD_0":
                 """go to free cam"""
                 self.is_free_cam = True
-                self.free_cam_trigger = True 
+                self.free_cam_trigger = True
 
             elif event.input.name in "NUMPAD_1":
                 """back to root cam"""
                 self.is_free_cam = False
-                self.free_cam_trigger = False 
+                self.free_cam_trigger = False
 
     def _update_tracking_callback(self, event):
-        if self.cfg.origin_type == "asset_root" and self.cfg.asset_name is not None and not self.is_free_cam:
+        if (
+            self.cfg.origin_type == "asset_root"
+            and self.cfg.asset_name is not None
+            and not self.is_free_cam
+        ):
             self.update_view_to_asset_root(self.cfg.asset_name)
-        if self.cfg.origin_type == "asset_body" and self.cfg.asset_name is not None and self.cfg.body_name is not None and not self.is_free_cam:
+        if (
+            self.cfg.origin_type == "asset_body"
+            and self.cfg.asset_name is not None
+            and self.cfg.body_name is not None
+            and not self.is_free_cam
+        ):
             self.update_view_to_asset_body(self.cfg.asset_name, self.cfg.body_name)
 
         if self.is_free_cam and self.free_cam_trigger:
-            self.free_cam_trigger = False 
-            if self.cfg.origin_type == "asset_root" and self.cfg.asset_name is not None :
+            self.free_cam_trigger = False
+            if self.cfg.origin_type == "asset_root" and self.cfg.asset_name is not None:
                 self.update_view_to_asset_root(self.cfg.asset_name)
-            if self.cfg.origin_type == "asset_body" and self.cfg.asset_name is not None and self.cfg.body_name is not None:
+            if (
+                self.cfg.origin_type == "asset_body"
+                and self.cfg.asset_name is not None
+                and self.cfg.body_name is not None
+            ):
                 self.update_view_to_asset_body(self.cfg.asset_name, self.cfg.body_name)

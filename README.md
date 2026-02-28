@@ -2,6 +2,13 @@
 
 面向 Galileo 机器人复杂地形全向移动任务的 FPPO + Teacher-Student 训练与评估说明。
 
+## 项目结构
+- 任务配置入口：`crl_tasks/crl_tasks/tasks/galileo/`
+- 统一配置默认值：`crl_tasks/crl_tasks/tasks/galileo/config/defaults.py`
+- Gym 注册：`crl_tasks/crl_tasks/tasks/galileo/__init__.py`
+- 算法扩展说明：`docs/ALGORITHMS.md`
+- 结构说明详见：`docs/STRUCTURE.md` / `docs/STYLE.md`
+
 ## 安装
 ```bash
 cd /home/lz/Project/IsaacLab/fppo_ts
@@ -30,7 +37,7 @@ cd /home/lz/Project/IsaacLab/fppo_ts
 通过 `--algo` 覆盖默认算法（默认使用配置文件内的 `class_name`，当前 Teacher/Student 默认 FPPO）。
 
 可选值：
-- `fppo` / `ppo` / `ppo_lagrange` / `cpo` / `pcpo` / `focpo` / `distillation`（使用 `scripts/rsl_rl/algorithms/` 里的实现）
+- `fppo` / `np3o` / `ppo` / `ppo_lagrange` / `cpo` / `pcpo` / `focpo` / `distillation`（使用 `scripts/rsl_rl/algorithms/` 里的实现）
 
 示例：
 ```bash

@@ -9,6 +9,7 @@ from isaaclab.utils import configclass
 from isaaclab.actuators.actuator_cfg import DCMotorCfg
 from . import crl_actuator_pd
 
+
 @configclass
 class CRLDCMotorCfg(DCMotorCfg):
 

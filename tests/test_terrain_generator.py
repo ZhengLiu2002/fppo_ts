@@ -3,14 +3,19 @@ import argparse
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="This script demonstrates the different camera sensor implementations.")
+parser = argparse.ArgumentParser(
+    description="This script demonstrates the different camera sensor implementations."
+)
 parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to spawn.")
-parser.add_argument("--disable_fabric", action="store_true", help="Disable Fabric API and use USD instead.")
+parser.add_argument(
+    "--disable_fabric", action="store_true", help="Disable Fabric API and use USD instead."
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 import cv2
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -30,7 +35,7 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 
-from crl_tasks.crl_task.config.galileo.config_summary import _galileo_robot_cfg
+from crl_tasks.tasks.galileo.config.defaults import _galileo_robot_cfg
 from crl_isaaclab.terrains.crl_terrain_importer import CRLTerrainImporter
 from tests.utils.test_terrain_config import SAFELOCOMOTION_TERRAINS_CFG
 
@@ -40,7 +45,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
 
     # ground plane
     terrain = TerrainImporterCfg(
-        class_type= CRLTerrainImporter,
+        class_type=CRLTerrainImporter,
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=SAFELOCOMOTION_TERRAINS_CFG,
@@ -68,7 +73,9 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     )
     # robot
     robot: ArticulationCfg = _galileo_robot_cfg()
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, debug_vis= True)
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, debug_vis=True
+    )
     height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
@@ -77,6 +84,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         debug_vis=True,
         mesh_prim_paths=["/World/ground"],
     )
+
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Run the simulator."""
@@ -128,7 +136,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         count += 1
         # update buffers
         scene.update(sim_dt)
-        
 
 
 def main():

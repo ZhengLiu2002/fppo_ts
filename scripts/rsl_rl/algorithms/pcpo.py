@@ -38,6 +38,10 @@ class PCPO(CPO):
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         normalize_cost_advantage: bool = False,
+        cost_viol_loss_coef: float = 0.0,
+        k_value: float = 1.0,
+        k_growth: float = 1.0,
+        k_max: float = 1.0,
         multi_gpu_cfg: dict | None = None,
     ):
         super().__init__(
@@ -66,5 +70,9 @@ class PCPO(CPO):
             device=device,
             normalize_advantage_per_mini_batch=normalize_advantage_per_mini_batch,
             normalize_cost_advantage=normalize_cost_advantage,
+            cost_viol_loss_coef=cost_viol_loss_coef,
+            k_value=k_value,
+            k_growth=k_growth,
+            k_max=k_max,
             multi_gpu_cfg=multi_gpu_cfg,
         )

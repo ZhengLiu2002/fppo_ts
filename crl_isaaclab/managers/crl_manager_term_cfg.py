@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import torch
@@ -7,6 +6,7 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any
 
 from isaaclab.utils import configclass
+
 # from isaaclab.utils.modifiers import ModifierCfg
 # from isaaclab.utils.noise import NoiseCfg
 
@@ -15,9 +15,10 @@ from isaaclab.utils import configclass
 if TYPE_CHECKING:
     from .crl_manager import CRLTerm
 
+
 @configclass
 class CRLTermCfg:
 
     class_type: type[CRLTerm] = MISSING
 
-    debug_vis:bool = False 
+    debug_vis: bool = False

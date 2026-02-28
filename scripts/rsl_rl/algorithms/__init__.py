@@ -5,22 +5,37 @@
 
 """Implementation of different RL agents."""
 
-from .cpo import CPO
-from .distillation import Distillation
-from .focpo import FOCPO
-from .fppo import FPPO
-from .pcpo import PCPO
-from .ppo import PPO
-from .ppo_lagrange import PPOLagrange
+from .registry import (
+    get_algorithm_class,
+    list_algorithm_names,
+    list_algorithm_aliases,
+    register_algorithm,
+)
 
-ALGORITHM_REGISTRY = {
-    "ppo": PPO,
-    "fppo": FPPO,
-    "ppo_lagrange": PPOLagrange,
-    "cpo": CPO,
-    "pcpo": PCPO,
-    "focpo": FOCPO,
-    "distillation": Distillation,
-}
+PPO = get_algorithm_class("ppo")
+FPPO = get_algorithm_class("fppo")
+NP3O = get_algorithm_class("np3o")
+PPOLagrange = get_algorithm_class("ppo_lagrange")
+CPO = get_algorithm_class("cpo")
+PCPO = get_algorithm_class("pcpo")
+FOCPO = get_algorithm_class("focpo")
+Distillation = get_algorithm_class("distillation")
 
-__all__ = ["PPO", "FPPO", "PPOLagrange", "CPO", "PCPO", "FOCPO", "Distillation", "ALGORITHM_REGISTRY"]
+# Backward-compatible mapping (lower-case keys).
+ALGORITHM_REGISTRY = {name: get_algorithm_class(name) for name in list_algorithm_names()}
+
+__all__ = [
+    "PPO",
+    "FPPO",
+    "NP3O",
+    "PPOLagrange",
+    "CPO",
+    "PCPO",
+    "FOCPO",
+    "Distillation",
+    "ALGORITHM_REGISTRY",
+    "get_algorithm_class",
+    "list_algorithm_names",
+    "list_algorithm_aliases",
+    "register_algorithm",
+]

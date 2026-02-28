@@ -1,6 +1,6 @@
 from crl_isaaclab.terrains.crl_terrain_generator_cfg import CRLTerrainGeneratorCfg
 from crl_isaaclab.terrains.crl_terrains import crl_terrains
-from crl_isaaclab.terrains.crl_terrains.crl_terrains_cfg import * 
+from crl_isaaclab.terrains.crl_terrains.crl_terrains_cfg import *
 
 EXTREME_SAFELOCOMOTION_TERRAINS_CFG = CRLTerrainGeneratorCfg(
     # Align global terrain generator settings with FPPO rough-terrain configuration.

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import torch
@@ -6,15 +5,18 @@ import torch.nn as nn
 import torch.optim as optim
 from .feature_extractors import DepthOnlyFCBackbone58x87, RecurrentDepthBackbone
 from .actor_critic_with_encoder import ActorCriticRMA
-from copy import deepcopy  
+from copy import deepcopy
 
-class DistillationWithExtractor():
+
+class DistillationWithExtractor:
     """视觉蒸馏算法包装：用深度编码器+学生 actor 拟合教师动作。"""
+
     policy: ActorCriticRMA
+
     def __init__(
         self,
         policy,
-        estimator, 
+        estimator,
         estimator_paras,
         learning_rate,
         depth_encoder_cfg,
@@ -22,7 +24,7 @@ class DistillationWithExtractor():
         device,
         max_grad_norm=1.0,
         multi_gpu_cfg: dict | None = None,
-        ):
+    ):
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
@@ -40,25 +42,33 @@ class DistillationWithExtractor():
         self.policy = policy
         estimator_params = list(self.estimator.parameters())
         self.estimator_optimizer = (
-            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"]) if estimator_params else None
+            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"])
+            if estimator_params
+            else None
         )
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         self.rnd = None  # TODO: remove when runner has a proper base class
 
         depth_backbone_class = eval(depth_encoder_cfg.pop("backbone_class_name"))
-        depth_backbone : DepthOnlyFCBackbone58x87 = depth_backbone_class( 
-            policy_cfg["scan_encoder_dims"][-1], depth_encoder_cfg["hidden_dims"],
+        depth_backbone: DepthOnlyFCBackbone58x87 = depth_backbone_class(
+            policy_cfg["scan_encoder_dims"][-1],
+            depth_encoder_cfg["hidden_dims"],
         )
         depth_encoder_class = eval(depth_encoder_cfg.pop("encoder_class_name"))
-        depth_encoder: RecurrentDepthBackbone = depth_encoder_class(depth_backbone, depth_encoder_cfg).to(device)
+        depth_encoder: RecurrentDepthBackbone = depth_encoder_class(
+            depth_backbone, depth_encoder_cfg
+        ).to(device)
         depth_actor: ActorCriticRMA = deepcopy(policy.actor)
         self.learning_rate = depth_encoder_cfg["learning_rate"]
         self.max_grad_norm = max_grad_norm
         self.depth_encoder = depth_encoder
         self.depth_encoder_cfg = depth_encoder_cfg
         self.depth_actor = depth_actor
-        self.depth_actor_optimizer = optim.Adam([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], lr=depth_encoder_cfg["learning_rate"])
+        self.depth_actor_optimizer = optim.Adam(
+            [*self.depth_actor.parameters(), *self.depth_encoder.parameters()],
+            lr=depth_encoder_cfg["learning_rate"],
+        )
 
     def broadcast_parameters(self):
         """同步教师/估计器/深度编码器/学生 actor 参数到所有 GPU。"""
@@ -121,7 +131,9 @@ class DistillationWithExtractor():
     def reduce_parameters(self):
         """仅对 policy 梯度做平均（覆盖上方函数，历史遗留接口）。"""
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads = [
+            param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None
+        ]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)

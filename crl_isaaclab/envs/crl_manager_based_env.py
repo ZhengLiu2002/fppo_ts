@@ -20,6 +20,7 @@ from isaaclab.sim import SimulationContext
 
 from crl_isaaclab.envs.crl_viewport_camera_controller import CRLViewportCameraController
 
+
 class CRLManagerBasedEnv(ManagerBasedEnv):
     def __init__(self, cfg: CRLManagerBasedEnvCfg):
         self.cfg: CRLManagerBasedEnvCfg
@@ -33,7 +34,9 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
         if self.cfg.seed is not None:
             self.cfg.seed = self.seed(self.cfg.seed)
         else:
-            omni.log.warn("Seed not set for the environment. The environment creation may not be deterministic.")
+            omni.log.warn(
+                "Seed not set for the environment. The environment creation may not be deterministic."
+            )
 
         # create a simulation context to control the simulator
         if SimulationContext.instance() is None:
@@ -124,7 +127,6 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
         # initialize observation buffers
         self.obs_buf = {}
 
-
     def load_managers(self):
         # prepare the managers
         # -- event manager (we print it here to make the logging consistent)
@@ -138,6 +140,7 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
         # -- crl manager (optional)
         if self.cfg.crl_events is not None:
             from crl_isaaclab.managers import CRLManager
+
             self.crl_manager = CRLManager(self.cfg.crl_events, self)
             print("[INFO] CRL Manager:", self.crl_manager)
         else:
@@ -153,7 +156,10 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
             self.event_manager.apply(mode="startup")
 
     def reset(
-        self, seed: int | None = None, env_ids: Sequence[int] | None = None, options: dict[str, Any] | None = None
+        self,
+        seed: int | None = None,
+        env_ids: Sequence[int] | None = None,
+        options: dict[str, Any] | None = None,
     ) -> tuple[VecEnvObs, dict]:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
@@ -186,8 +192,6 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
         # return observations
         return self.obs_buf, self.extras
 
-
-
     def _reset_idx(self, env_ids: Sequence[int]):
         """Reset environments based on specified indices.
 
@@ -204,7 +208,9 @@ class CRLManagerBasedEnv(ManagerBasedEnv):
         # apply events such as randomization for environments that need a reset
         if "reset" in self.event_manager.available_modes:
             env_step_count = self._sim_step_counter // self.cfg.decimation
-            self.event_manager.apply(mode="reset", env_ids=env_ids, global_env_step_count=env_step_count)
+            self.event_manager.apply(
+                mode="reset", env_ids=env_ids, global_env_step_count=env_step_count
+            )
 
         # iterate over all managers and reset them
         # this returns a dictionary of information which is stored in the extras

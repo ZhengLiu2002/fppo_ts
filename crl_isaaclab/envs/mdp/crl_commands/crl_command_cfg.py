@@ -1,22 +1,31 @@
 from isaaclab.managers import CommandTermCfg
 from isaaclab.markers import VisualizationMarkersCfg
-from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, FRAME_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
+from isaaclab.markers.config import (
+    BLUE_ARROW_X_MARKER_CFG,
+    FRAME_MARKER_CFG,
+    GREEN_ARROW_X_MARKER_CFG,
+)
 from isaaclab.utils import configclass
 
 import math
 from dataclasses import MISSING
 from .uniform_crl_command import UniformCRLCommand
 
+
 @configclass
 class CRLCommandCfg(CommandTermCfg):
     class_type: type = UniformCRLCommand
     asset_name: str = MISSING
     heading_control_stiffness: float = 1.0
-    small_commands_to_zero: bool = True 
+    small_commands_to_zero: bool = True
     heading_command: bool = True
     rel_heading_envs: float = 1.0
     rel_standing_envs: float = 0.0
     align_to_crl_goal: bool = False
+    # If enabled, command ranges are additionally scaled by terrain levels in
+    # UniformCRLCommand._resample_command. Keep disabled when using curriculum
+    # terms as the single source of command difficulty.
+    terrain_level_range_scaling: bool = False
     # curriculum levels for progressive command ranges
     lin_x_level: float = 0.0
     max_lin_x_level: float = 1.0
@@ -42,10 +51,10 @@ class CRLCommandCfg(CommandTermCfg):
         max_curriculum_lin_x: tuple[float, float] | None = None
         max_curriculum_ang_z: tuple[float, float] | None = None
 
-    @configclass 
+    @configclass
     class Clips:
-        lin_vel_clip: float = MISSING 
-        ang_vel_clip: float = MISSING 
+        lin_vel_clip: float = MISSING
+        ang_vel_clip: float = MISSING
 
     ranges: Ranges = MISSING
     clips: Clips = MISSING

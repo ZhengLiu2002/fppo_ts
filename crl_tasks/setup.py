@@ -8,7 +8,7 @@
 import os
 import toml
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 # Obtain the extension data from the extension.toml file
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -26,12 +26,12 @@ setup(
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     include_package_data=True,
     python_requires=">=3.10",
-    packages=["crl_tasks"],
+    packages=find_packages(exclude=("tests", "tests.*")),
     classifiers=[
         "Natural Language :: English",
         "Programming Language :: Python :: 3.10",
         "Isaac Sim :: 4.5.0",
     ],
     zip_safe=False,
-    install_requires=['fast_simplification']
+    install_requires=["fast_simplification"],
 )

@@ -94,8 +94,16 @@ def _resolve_gait_frequency(
     speed = torch.linalg.norm(commands[:, :2], dim=1)
 
     if max_command_speed is not None and max_command_speed > 0.0:
-        min_f = base_t if min_frequency is None else torch.as_tensor(min_frequency, device=device, dtype=dtype)
-        max_f = base_t if max_frequency is None else torch.as_tensor(max_frequency, device=device, dtype=dtype)
+        min_f = (
+            base_t
+            if min_frequency is None
+            else torch.as_tensor(min_frequency, device=device, dtype=dtype)
+        )
+        max_f = (
+            base_t
+            if max_frequency is None
+            else torch.as_tensor(max_frequency, device=device, dtype=dtype)
+        )
         max_speed_t = torch.as_tensor(max_command_speed, device=device, dtype=dtype)
         ratio = torch.clamp(speed / max_speed_t, 0.0, 1.0)
         freq = min_f + (max_f - min_f) * ratio
@@ -104,8 +112,16 @@ def _resolve_gait_frequency(
         freq = base_t + speed * scale_t
 
     if min_frequency is not None or max_frequency is not None:
-        min_f = base_t if min_frequency is None else torch.as_tensor(min_frequency, device=device, dtype=dtype)
-        max_f = base_t if max_frequency is None else torch.as_tensor(max_frequency, device=device, dtype=dtype)
+        min_f = (
+            base_t
+            if min_frequency is None
+            else torch.as_tensor(min_frequency, device=device, dtype=dtype)
+        )
+        max_f = (
+            base_t
+            if max_frequency is None
+            else torch.as_tensor(max_frequency, device=device, dtype=dtype)
+        )
         freq = torch.clamp(freq, min=min_f, max=max_f)
 
     return freq
@@ -163,7 +179,9 @@ def _terrain_height_at_points(
     sensor = env.scene.sensors[sensor_cfg.name]
     ray_hits = getattr(sensor.data, "ray_hits_w", None)
     if ray_hits is None:
-        _warn_once(env, "_warn_missing_ray_hits", "Ray hits not available; using zero terrain height.")
+        _warn_once(
+            env, "_warn_missing_ray_hits", "Ray hits not available; using zero terrain height."
+        )
         return torch.zeros(points_w.shape[:2], device=points_w.device, dtype=points_w.dtype)
 
     invalid = torch.isinf(ray_hits).any(dim=-1) | torch.isnan(ray_hits).any(dim=-1)
@@ -209,7 +227,11 @@ def constraint_joint_pos(
     joint_ids = _get_joint_slice(asset_cfg)
     joint_pos = asset.data.joint_pos
     if joint_pos is None:
-        _warn_once(env, "_warn_missing_joint_pos", "Joint positions not available; joint_pos constraint disabled.")
+        _warn_once(
+            env,
+            "_warn_missing_joint_pos",
+            "Joint positions not available; joint_pos constraint disabled.",
+        )
         return _zeros_like_env(env)
     if not isinstance(joint_ids, slice):
         joint_pos = joint_pos[:, joint_ids]
@@ -217,7 +239,9 @@ def constraint_joint_pos(
     limits = getattr(asset.data, "soft_joint_pos_limits", None)
     if limits is None:
         _warn_once(
-            env, "_warn_missing_soft_joint_limits", "soft_joint_pos_limits not found; joint_pos constraint disabled."
+            env,
+            "_warn_missing_soft_joint_limits",
+            "soft_joint_pos_limits not found; joint_pos constraint disabled.",
         )
         return _zeros_like_env(env, dtype=joint_pos.dtype)
 
@@ -321,7 +345,9 @@ def com_frame_prob_constraint(
     com_pos = asset.data.root_com_pos_w
     height = com_pos[:, 2]
     if terrain_sensor_cfg is not None:
-        terrain_h = _terrain_height_at_points(env, terrain_sensor_cfg, com_pos.unsqueeze(1)).squeeze(1)
+        terrain_h = _terrain_height_at_points(
+            env, terrain_sensor_cfg, com_pos.unsqueeze(1)
+        ).squeeze(1)
         height = height - terrain_h
     if height_offset != 0.0:
         height = height - height_offset
@@ -359,7 +385,9 @@ def gait_pattern_prob_constraint(
     dt = env.step_dt if hasattr(env, "step_dt") else 0.0
     phase_offsets = phase_offsets or [0.0] * len(foot_ids)
     phase_offsets = phase_offsets[: len(foot_ids)]
-    phase_offsets = torch.as_tensor(phase_offsets, device=contact_sensor.data.net_forces_w.device, dtype=torch.float32)
+    phase_offsets = torch.as_tensor(
+        phase_offsets, device=contact_sensor.data.net_forces_w.device, dtype=torch.float32
+    )
     freq = _resolve_gait_frequency(
         env,
         command_name=command_name,
@@ -374,7 +402,10 @@ def gait_pattern_prob_constraint(
     t = getattr(env, "_sim_step_counter", 0) * dt
     phase = (t * freq.unsqueeze(-1) + phase_offsets) % 1.0
     stance = phase < stance_ratio
-    contact = contact_sensor.data.net_forces_w_history[..., foot_ids].norm(dim=-1).max(dim=1)[0] > contact_threshold
+    contact = (
+        contact_sensor.data.net_forces_w_history[..., foot_ids].norm(dim=-1).max(dim=1)[0]
+        > contact_threshold
+    )
     cost = (stance != contact).float().mean(dim=1)
     gate = _command_gate(
         env,
@@ -454,7 +485,9 @@ def foot_clearance_constraint(
     dt = env.step_dt if hasattr(env, "step_dt") else 0.0
     phase_offsets = phase_offsets or [0.0] * len(foot_ids)
     phase_offsets = phase_offsets[: len(foot_ids)]
-    phase_offsets = torch.as_tensor(phase_offsets, device=foot_heights.device, dtype=foot_heights.dtype)
+    phase_offsets = torch.as_tensor(
+        phase_offsets, device=foot_heights.device, dtype=foot_heights.dtype
+    )
     freq = _resolve_gait_frequency(
         env,
         command_name=command_name,
@@ -568,7 +601,11 @@ def constraint_joint_vel(
     joint_ids = _get_joint_slice(asset_cfg)
     joint_vel = getattr(asset.data, "joint_vel", None)
     if joint_vel is None:
-        _warn_once(env, "_warn_missing_joint_vel", "Joint velocities not available; joint_vel constraint disabled.")
+        _warn_once(
+            env,
+            "_warn_missing_joint_vel",
+            "Joint velocities not available; joint_vel constraint disabled.",
+        )
         return _zeros_like_env(env)
     if not isinstance(joint_ids, slice):
         joint_vel = joint_vel[:, joint_ids]
@@ -587,7 +624,11 @@ def constraint_joint_torque(
     joint_ids = _get_joint_slice(asset_cfg)
     torque = getattr(asset.data, "applied_torque", None)
     if torque is None:
-        _warn_once(env, "_warn_missing_applied_torque", "Applied torque not available; torque constraint disabled.")
+        _warn_once(
+            env,
+            "_warn_missing_applied_torque",
+            "Applied torque not available; torque constraint disabled.",
+        )
         return _zeros_like_env(env)
     if not isinstance(joint_ids, slice):
         torque = torque[:, joint_ids]
@@ -613,7 +654,11 @@ def constraint_com_orientation(
         asset: Articulation = env.scene[asset_cfg.name]
         projected_gravity = getattr(asset.data, "projected_gravity_b", None)
     if projected_gravity is None:
-        _warn_once(env, "_warn_missing_projected_gravity", "Projected gravity not available; tilt constraint disabled.")
+        _warn_once(
+            env,
+            "_warn_missing_projected_gravity",
+            "Projected gravity not available; tilt constraint disabled.",
+        )
         return _zeros_like_env(env)
     gravity_xy = projected_gravity[:, :2]
     tilt = torch.norm(gravity_xy, dim=1)
@@ -626,7 +671,9 @@ def _compute_contact_prob(
     threshold: float,
     dim: int = -1,
 ) -> torch.Tensor:
-    threshold_t = torch.as_tensor(threshold, device=contact_forces.device, dtype=contact_forces.dtype)
+    threshold_t = torch.as_tensor(
+        threshold, device=contact_forces.device, dtype=contact_forces.dtype
+    )
     magnitude = torch.norm(contact_forces, dim=dim)
     return (magnitude > threshold_t).float()
 
@@ -645,4 +692,3 @@ def _get_contact_prob(
     forces = forces[:, body_ids]
     prob = _compute_contact_prob(forces, threshold)
     return prob.mean(dim=1)
-

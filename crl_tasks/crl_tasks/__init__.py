@@ -12,7 +12,9 @@ import toml
 ISAACLAB_TASKS_EXT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 """Path to the extension source directory."""
 
-ISAACLAB_TASKS_METADATA = toml.load(os.path.join(ISAACLAB_TASKS_EXT_DIR, "config", "extension.toml"))
+ISAACLAB_TASKS_METADATA = toml.load(
+    os.path.join(ISAACLAB_TASKS_EXT_DIR, "config", "extension.toml")
+)
 """Extension metadata dictionary parsed from the extension.toml file."""
 
 # Configure the module-level variables
@@ -24,7 +26,8 @@ __version__ = ISAACLAB_TASKS_METADATA["package"]["version"]
 
 from isaaclab_tasks.utils import import_packages
 
-# The blacklist is used to prevent importing configs from sub-packages
+# The blacklist is used to prevent importing configs from sub-packages.
+# We also skip legacy modules kept only for backward compatibility.
 # TODO(@ashwinvk): Remove pick_place from the blacklist once pinocchio from Isaac Sim is compatibility
 _BLACKLIST_PKGS = ["utils", ".mdp", "pick_place"]
 # Import all configs in this package

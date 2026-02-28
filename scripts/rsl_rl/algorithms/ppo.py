@@ -44,6 +44,12 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Cost advantage normalization
         normalize_cost_advantage: bool = False,
+        # Positive-part cost violation regularization
+        cost_limit: float = 0.0,
+        cost_viol_loss_coef: float = 0.0,
+        k_value: float = 1.0,
+        k_growth: float = 1.0,
+        k_max: float = 1.0,
         # VAE auxiliary parameters
         learning_rate_vae: float = 2.0e-3,
         vae_beta: float = 0.01,
@@ -70,7 +76,10 @@ class PPO:
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Optional VAE optimizer (auxiliary)
         self.vae_optimizer = None
-        if getattr(self.policy, "vae_enabled", False) and getattr(self.policy, "vae", None) is not None:
+        if (
+            getattr(self.policy, "vae_enabled", False)
+            and getattr(self.policy, "vae", None) is not None
+        ):
             vae_lr = getattr(self.policy, "vae_learning_rate", None)
             if vae_lr is None:
                 vae_lr = learning_rate
@@ -97,6 +106,11 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.normalize_cost_advantage = normalize_cost_advantage
+        self.cost_limit = cost_limit
+        self.cost_viol_loss_coef = cost_viol_loss_coef
+        self.k_value = float(k_value)
+        self.k_growth = float(k_growth)
+        self.k_max = float(k_max)
         # VAE parameters
         self.learning_rate_vae = learning_rate_vae
         self.vae_beta = vae_beta
@@ -107,6 +121,7 @@ class PPO:
         # VAE slices
         self._critic_obs_slices = {}
         self._amp_obs_slices = {}
+        self.train_metrics: dict[str, float] = {}
 
     def init_storage(
         self,
@@ -136,7 +151,9 @@ class PPO:
             amp_obs_shape=amp_obs_shape,
         )
 
-    def set_vae_obs_slices(self, critic_obs_slices: dict[str, slice] | None, amp_obs_slices: dict[str, slice] | None):
+    def set_vae_obs_slices(
+        self, critic_obs_slices: dict[str, slice] | None, amp_obs_slices: dict[str, slice] | None
+    ):
         self._critic_obs_slices = critic_obs_slices or {}
         self._amp_obs_slices = amp_obs_slices or {}
 
@@ -146,6 +163,33 @@ class PPO:
     def _resolve_amp_obs_slice(self, name: str, fallback: slice) -> slice:
         return self._amp_obs_slices.get(name, fallback)
 
+    def _all_reduce_mean(self, value: torch.Tensor) -> torch.Tensor:
+        if self.is_multi_gpu:
+            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+            value /= self.gpu_world_size
+        return value
+
+    def _batch_cost_stats(
+        self, cost_returns_batch: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cost_return_mean = self._all_reduce_mean(cost_returns_batch.mean())
+        cost_violation_rate = self._all_reduce_mean(
+            (cost_returns_batch > self.cost_limit).float().mean()
+        )
+        c_hat = cost_return_mean - self.cost_limit
+        return cost_return_mean, cost_violation_rate, c_hat
+
+    def _positive_cost_penalty(
+        self, cost_surrogate: torch.Tensor, c_hat: torch.Tensor, detach_violation: bool = True
+    ) -> torch.Tensor:
+        if self.cost_viol_loss_coef <= 0.0 or self.k_value <= 0.0:
+            return torch.zeros((), device=cost_surrogate.device, dtype=cost_surrogate.dtype)
+        violation = c_hat.detach() if detach_violation else c_hat
+        return self.cost_viol_loss_coef * self.k_value * torch.relu(cost_surrogate + violation)
+
+    def _step_constraint_scale(self):
+        self.k_value = min(self.k_max, self.k_value * self.k_growth)
+
     def act(self, obs, critic_obs, hist_encoding=False, actor_obs=None, vae_obs_history=None):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
@@ -153,7 +197,9 @@ class PPO:
         self.transition.actions = self.policy.act(obs, hist_encoding).detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.cost_values = self.policy.evaluate_cost(critic_obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(
+            self.transition.actions
+        ).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
@@ -163,7 +209,9 @@ class PPO:
         self.transition.vae_obs_history = vae_obs_history
         return self.transition.actions
 
-    def process_env_step(self, obs, rewards, dones, infos, costs=None, next_actor_obs=None, next_amp_obs=None):
+    def process_env_step(
+        self, obs, rewards, dones, infos, costs=None, next_actor_obs=None, next_amp_obs=None
+    ):
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -177,8 +225,12 @@ class PPO:
         # Bootstrapping on time outs
         if "time_outs" in infos:
             time_outs = infos["time_outs"].unsqueeze(1).to(self.device)
-            self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * time_outs, 1)
-            self.transition.cost_rewards += self.cost_gamma * torch.squeeze(self.transition.cost_values * time_outs, 1)
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * time_outs, 1
+            )
+            self.transition.cost_rewards += self.transition.cost_rewards + self.cost_gamma * torch.squeeze(
+                self.transition.cost_values * time_outs, 1
+            )
 
         # record the transition
         self.storage.add_transitions(self.transition)
@@ -206,6 +258,9 @@ class PPO:
         mean_cost_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_viol_loss = 0.0
+        mean_cost_return = 0.0
+        mean_cost_violation = 0.0
         mean_vae_vel_loss = 0.0
         mean_vae_mass_loss = 0.0
         mean_vae_decode_loss = 0.0
@@ -215,9 +270,13 @@ class PPO:
 
         # generator for mini batches
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
 
         # iterate over batches
         for (
@@ -244,11 +303,13 @@ class PPO:
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1e-8
+                    )
                     if self.normalize_cost_advantage:
-                        cost_advantages_batch = (cost_advantages_batch - cost_advantages_batch.mean()) / (
-                            cost_advantages_batch.std() + 1e-8
-                        )
+                        cost_advantages_batch = (
+                            cost_advantages_batch - cost_advantages_batch.mean()
+                        ) / (cost_advantages_batch.std() + 1e-8)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
@@ -256,7 +317,9 @@ class PPO:
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(
+                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+            )
             cost_value_batch = self.policy.evaluate_cost(
                 critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[2]
             )
@@ -273,7 +336,7 @@ class PPO:
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
-                        axis=-1,
+                        dim=-1,
                     )
                     kl_mean = torch.mean(kl)
 
@@ -309,6 +372,11 @@ class PPO:
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            cost_surrogate = (torch.squeeze(cost_advantages_batch) * ratio).mean()
+            batch_cost_return, batch_cost_violation, c_hat = self._batch_cost_stats(
+                cost_returns_batch
+            )
+            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat)
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -323,9 +391,9 @@ class PPO:
 
             # Cost value function loss
             if self.use_clipped_value_loss:
-                cost_value_clipped = cost_values_batch + (cost_value_batch - cost_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
+                cost_value_clipped = cost_values_batch + (
+                    cost_value_batch - cost_values_batch
+                ).clamp(-self.clip_param, self.clip_param)
                 cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
                 cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
@@ -334,6 +402,7 @@ class PPO:
 
             loss = (
                 surrogate_loss
+                + viol_loss
                 + self.value_loss_coef * value_loss
                 + self.cost_value_loss_coef * cost_value_loss
                 - self.entropy_coef * entropy_batch.mean()
@@ -352,6 +421,7 @@ class PPO:
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._step_constraint_scale()
 
             # Optional VAE update
             if (
@@ -389,7 +459,10 @@ class PPO:
                 loss_recon_decode = nn.MSELoss()(vae_decoded, vae_decode_target)
                 loss_recon = loss_recon_vel + loss_recon_mass + loss_recon_decode
 
-                k = math.exp(self.learning_rate_vae * (self.vae_desired_recon_loss - loss_recon_decode.item()))
+                k = math.exp(
+                    self.learning_rate_vae
+                    * (self.vae_desired_recon_loss - loss_recon_decode.item())
+                )
                 self.vae_beta = max(self.vae_beta_min, min(self.vae_beta_max, k * self.vae_beta))
 
                 kl_div = -0.5 * torch.sum(
@@ -413,9 +486,13 @@ class PPO:
                         sigma = torch.clamp(sigma, min=1.0e-4)
                         sigma_sq = sigma**2
                         diff_sq = torch.sum((target_xy - mu).pow(2), dim=-1)
-                        derived_action_loss = (diff_sq / (2.0 * sigma_sq) + torch.log(sigma_sq)).mean()
+                        derived_action_loss = (
+                            diff_sq / (2.0 * sigma_sq) + torch.log(sigma_sq)
+                        ).mean()
 
-                vae_loss = loss_recon + kl_loss + self.derived_action_loss_weight * derived_action_loss
+                vae_loss = (
+                    loss_recon + kl_loss + self.derived_action_loss_weight * derived_action_loss
+                )
 
                 self.vae_optimizer.zero_grad()
                 vae_loss.backward()
@@ -433,6 +510,9 @@ class PPO:
             mean_cost_value_loss += cost_value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_viol_loss += viol_loss.item()
+            mean_cost_return += batch_cost_return.item()
+            mean_cost_violation += batch_cost_violation.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -440,6 +520,9 @@ class PPO:
         mean_cost_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_viol_loss /= num_updates
+        mean_cost_return /= num_updates
+        mean_cost_violation /= num_updates
         if num_updates > 0 and self.vae_optimizer is not None:
             mean_vae_vel_loss /= num_updates
             mean_vae_mass_loss /= num_updates
@@ -450,12 +533,21 @@ class PPO:
         # -- Clear the storage
         self.storage.clear()
 
+        self.train_metrics = {
+            "mean_cost_return": mean_cost_return,
+            "cost_limit_margin": self.cost_limit - mean_cost_return,
+            "cost_violation_rate": mean_cost_violation,
+            "viol_loss": mean_viol_loss,
+            "k_value": self.k_value,
+        }
+
         # construct the loss dictionary
         loss_dict = {
             "value_function": mean_value_loss,
             "cost_value_function": mean_cost_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "viol": mean_viol_loss,
         }
         if self.vae_optimizer is not None:
             loss_dict["vae_vel_loss"] = mean_vae_vel_loss
@@ -486,7 +578,9 @@ class PPO:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads = [
+            param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None
+        ]
         all_grads = torch.cat(grads)
 
         # Average the gradients across all GPUs

@@ -19,6 +19,7 @@ videos/
 runs/
 *.tfevents*
 wandb/
+*.log
 
 # === 模型权重文件 ===
 *.pt
@@ -34,3 +35,11 @@ wandb/
 
 # === 其他 ===
 .DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.cache/
+*.tmp
+*.bak

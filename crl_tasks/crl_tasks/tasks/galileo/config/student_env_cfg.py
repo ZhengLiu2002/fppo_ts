@@ -1,9 +1,14 @@
-from isaaclab.utils import configclass
+"""Student environment configuration for Galileo CRL tasks."""
+
+from __future__ import annotations
+
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.utils import configclass
 
 from crl_isaaclab.envs import CRLManagerBasedRLEnvCfg
-from .config_summary import VIEWER
-from .crl_mdp_cfg import (
+
+from .defaults import GalileoDefaults, VIEWER_CFG
+from .mdp_cfg import (
     ActionsCfg,
     CommandsCfg,
     CurriculumCfg,
@@ -13,17 +18,16 @@ from .crl_mdp_cfg import (
     StudentRewardsCfg,
     TerminationsCfg,
 )
-from .crl_teacher_cfg import GalileoCRLSceneCfg
-from .config_summary import ConfigSummary
+from .teacher_env_cfg import GalileoCRLSceneCfg
 
 
 @configclass
 class GalileoStudentSceneCfg(GalileoCRLSceneCfg):
     # Student keeps height_scanner for critic (privileged); actor still remains blind.
     contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base_link",
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
         history_length=2,
-        track_air_time=False,
+        track_air_time=True,
         debug_vis=False,
         force_threshold=1.0,
     )
@@ -44,14 +48,14 @@ class GalileoStudentCRLEnvCfg(CRLManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.decimation = ConfigSummary.general.decimation
-        self.episode_length_s = ConfigSummary.general.episode_length_s
-        self.sim.dt = ConfigSummary.sim.dt
+        self.decimation = GalileoDefaults.general.decimation
+        self.episode_length_s = GalileoDefaults.general.episode_length_s
+        self.sim.dt = GalileoDefaults.sim.dt
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
         self.sim.physx.gpu_found_lost_pairs_capacity = 10 * 1024 * 1024
-        self.scene.terrain.terrain_generator.curriculum = ConfigSummary.terrain.curriculum
+        self.scene.terrain.terrain_generator.curriculum = GalileoDefaults.terrain.curriculum
         # 蒸馏/学生策略开启关节延迟与历史，模拟实际执行链路的滞后
         self.actions.joint_pos.use_delay = True
         self.actions.joint_pos.history_length = 8
@@ -64,7 +68,7 @@ class GalileoStudentCRLEnvCfg(CRLManagerBasedRLEnvCfg):
 
 @configclass
 class GalileoStudentCRLEnvCfg_EVAL(GalileoStudentCRLEnvCfg):
-    viewer = VIEWER
+    viewer = VIEWER_CFG
     rewards: StudentRewardsCfg = StudentRewardsCfg()
 
     def __post_init__(self):

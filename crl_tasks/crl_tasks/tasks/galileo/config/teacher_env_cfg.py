@@ -1,3 +1,7 @@
+"""Teacher environment configuration for Galileo CRL tasks."""
+
+from __future__ import annotations
+
 import copy
 
 from isaaclab.assets import ArticulationCfg
@@ -5,9 +9,15 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
 from crl_isaaclab.envs import CRLManagerBasedRLEnvCfg
-from .config_summary import CRLDefaultSceneCfg, VIEWER, _galileo_robot_cfg
-from .config_summary import GALILEO_ROUGH_TERRAINS_CFG
-from .crl_mdp_cfg import (
+
+from .defaults import (
+    GALILEO_ROUGH_TERRAIN_CFG,
+    VIEWER_CFG,
+    GalileoBaseSceneCfg,
+    GalileoDefaults,
+    build_galileo_robot_cfg,
+)
+from .mdp_cfg import (
     ActionsCfg,
     CommandsCfg,
     CurriculumCfg,
@@ -17,11 +27,11 @@ from .crl_mdp_cfg import (
     TeacherRewardsCfg,
     TerminationsCfg,
 )
-from .config_summary import ConfigSummary
+
 
 @configclass
-class GalileoCRLSceneCfg(CRLDefaultSceneCfg):
-    robot: ArticulationCfg = _galileo_robot_cfg()
+class GalileoCRLSceneCfg(GalileoBaseSceneCfg):
+    robot: ArticulationCfg = build_galileo_robot_cfg()
     height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_link",
         offset=RayCasterCfg.OffsetCfg(pos=(0.375, 0.0, 20.0)),
@@ -42,18 +52,18 @@ class GalileoCRLSceneCfg(CRLDefaultSceneCfg):
     def __post_init__(self):
         super().__post_init__()
         # Ensure robot config uses Galileo (override base scene defaults).
-        self.robot = _galileo_robot_cfg()
+        self.robot = build_galileo_robot_cfg()
         # Rough terrain mix for omni-directional locomotion.
-        self.terrain.terrain_generator = copy.deepcopy(GALILEO_ROUGH_TERRAINS_CFG)
-        self.terrain.terrain_generator.size = ConfigSummary.terrain.size
-        self.terrain.terrain_generator.border_width = ConfigSummary.terrain.border_width
-        self.terrain.terrain_generator.num_rows = ConfigSummary.terrain.num_rows
-        self.terrain.terrain_generator.num_cols = ConfigSummary.terrain.num_cols
-        self.terrain.terrain_generator.horizontal_scale = ConfigSummary.terrain.horizontal_scale
-        self.terrain.terrain_generator.vertical_scale = ConfigSummary.terrain.vertical_scale
-        self.terrain.terrain_generator.slope_threshold = ConfigSummary.terrain.slope_threshold
-        self.terrain.terrain_generator.curriculum = ConfigSummary.terrain.curriculum
-        self.terrain.terrain_generator.difficulty_range = ConfigSummary.terrain.difficulty_range
+        self.terrain.terrain_generator = copy.deepcopy(GALILEO_ROUGH_TERRAIN_CFG)
+        self.terrain.terrain_generator.size = GalileoDefaults.terrain.size
+        self.terrain.terrain_generator.border_width = GalileoDefaults.terrain.border_width
+        self.terrain.terrain_generator.num_rows = GalileoDefaults.terrain.num_rows
+        self.terrain.terrain_generator.num_cols = GalileoDefaults.terrain.num_cols
+        self.terrain.terrain_generator.horizontal_scale = GalileoDefaults.terrain.horizontal_scale
+        self.terrain.terrain_generator.vertical_scale = GalileoDefaults.terrain.vertical_scale
+        self.terrain.terrain_generator.slope_threshold = GalileoDefaults.terrain.slope_threshold
+        self.terrain.terrain_generator.curriculum = GalileoDefaults.terrain.curriculum
+        self.terrain.terrain_generator.difficulty_range = GalileoDefaults.terrain.difficulty_range
 
 
 @configclass
@@ -71,17 +81,17 @@ class GalileoTeacherCRLEnvCfg(CRLManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.decimation = ConfigSummary.general.decimation
-        self.episode_length_s = ConfigSummary.general.episode_length_s
-        self.sim.dt = ConfigSummary.sim.dt
+        self.decimation = GalileoDefaults.general.decimation
+        self.episode_length_s = GalileoDefaults.general.episode_length_s
+        self.sim.dt = GalileoDefaults.sim.dt
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
         self.sim.physx.gpu_found_lost_pairs_capacity = 10 * 1024 * 1024
 
-        self.scene.terrain.terrain_generator.curriculum = ConfigSummary.terrain.curriculum
+        self.scene.terrain.terrain_generator.curriculum = GalileoDefaults.terrain.curriculum
         self.events.random_camera_position = None
-        self.events.push_robot_vel.interval_range_s = (6.0, 6.0)
+        self.events.push_robot_vel.interval_range_s = (8.0, 8.0)
         # sensor update periods
         self.scene.height_scanner.update_period = self.sim.dt * self.decimation
         self.scene.contact_forces.update_period = self.sim.dt * self.decimation
@@ -93,7 +103,7 @@ class GalileoTeacherCRLEnvCfg(CRLManagerBasedRLEnvCfg):
 
 @configclass
 class GalileoTeacherCRLEnvCfg_PLAY(GalileoTeacherCRLEnvCfg):
-    viewer = VIEWER
+    viewer = VIEWER_CFG
 
     def __post_init__(self):
         super().__post_init__()

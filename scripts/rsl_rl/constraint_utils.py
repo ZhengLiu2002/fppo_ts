@@ -92,7 +92,9 @@ class ConstraintNormalizer:
             normalized[name] = norm
         return normalized
 
-    def aggregate(self, cost_terms: dict[str, torch.Tensor | float]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def aggregate(
+        self, cost_terms: dict[str, torch.Tensor | float]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not cost_terms:
             return torch.zeros(0, device=self.device), {}
         normalized = self.normalize(cost_terms)

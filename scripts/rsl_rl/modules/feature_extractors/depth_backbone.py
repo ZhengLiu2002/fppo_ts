@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
-    
+
+
 class DepthOnlyFCBackbone58x87(nn.Module):
     """将 58x87 深度图压缩到与激光特征同维度的 MLP+Conv 编码器。"""
+
     def __init__(self, scandots_output_dim, output_activation=None, num_frames=1):
         super().__init__()
 
@@ -17,7 +19,7 @@ class DepthOnlyFCBackbone58x87(nn.Module):
             nn.Flatten(),
             nn.Linear(64 * 25 * 39, 128),
             activation,
-            nn.Linear(128, scandots_output_dim)
+            nn.Linear(128, scandots_output_dim),
         )
 
         if output_activation == "tanh":
@@ -29,42 +31,38 @@ class DepthOnlyFCBackbone58x87(nn.Module):
         images_compressed = self.image_compression(images.unsqueeze(1))
         latent = self.output_activation(images_compressed)
         return latent
-    
+
 
 class RecurrentDepthBackbone(nn.Module):
     """深度图 + 本体组合的时序编码：Conv 压缩 -> MLP 融合 -> GRU -> 输出特征+航向。"""
+
     def __init__(self, base_backbone, depth_cfg) -> None:
         super().__init__()
         activation = nn.ELU()
         last_activation = nn.Tanh()
         self.base_backbone = base_backbone
-        num_prop = depth_cfg['num_prop']
+        num_prop = depth_cfg["num_prop"]
         if num_prop == None:
             self.combination_mlp = nn.Sequential(
-                                    nn.Linear(32 + 53, 128),
-                                    activation,
-                                    nn.Linear(128, 32)
-                                )
+                nn.Linear(32 + 53, 128), activation, nn.Linear(128, 32)
+            )
         else:
             self.combination_mlp = nn.Sequential(
-                                        nn.Linear(32 + num_prop, 128),
-                                        activation,
-                                        nn.Linear(128, 32)
-                                    )
+                nn.Linear(32 + num_prop, 128), activation, nn.Linear(128, 32)
+            )
         self.recurrent_size = 512
-            
+
         self.rnn = nn.GRU(input_size=32, hidden_size=512, batch_first=True)
-        self.output_mlp = nn.Sequential(
-                                nn.Linear(512, 32+2),
-                                last_activation
-                            )
+        self.output_mlp = nn.Sequential(nn.Linear(512, 32 + 2), last_activation)
         self.hidden_states = torch.zeros(1, 0, 512)
         self.rnn.flatten_parameters()
 
     def forward(self, depth_image, proprioception):
         if self.hidden_states.shape[1] == 0:
             # On the first forward pass, initialize hidden states to proper batch size
-            self.hidden_states = torch.zeros(1, depth_image.shape[0], self.recurrent_size).to(depth_image.device)
+            self.hidden_states = torch.zeros(1, depth_image.shape[0], self.recurrent_size).to(
+                depth_image.device
+            )
 
         depth_image = self.base_backbone(depth_image)
         depth_latent = self.combination_mlp(torch.cat((depth_image, proprioception), dim=-1))

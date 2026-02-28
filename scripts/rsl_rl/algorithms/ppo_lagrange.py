@@ -39,6 +39,11 @@ class PPOLagrange(PPO):
         cost_limit=0.0,
         lagrange_lr=1e-2,
         lagrange_max=100.0,
+        # NP3O-style positive-part violation shaping
+        cost_viol_loss_coef: float = 0.0,
+        k_value: float = 1.0,
+        k_growth: float = 1.0,
+        k_max: float = 1.0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -62,9 +67,13 @@ class PPOLagrange(PPO):
             device=device,
             normalize_advantage_per_mini_batch=normalize_advantage_per_mini_batch,
             normalize_cost_advantage=normalize_cost_advantage,
+            cost_limit=cost_limit,
+            cost_viol_loss_coef=cost_viol_loss_coef,
+            k_value=k_value,
+            k_growth=k_growth,
+            k_max=k_max,
             multi_gpu_cfg=multi_gpu_cfg,
         )
-        self.cost_limit = cost_limit
         self.lagrange_lr = lagrange_lr
         self.lagrange_max = lagrange_max
         self.lagrange_multiplier = torch.tensor(0.0, device=self.device)
@@ -75,14 +84,19 @@ class PPOLagrange(PPO):
         mean_cost_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
+        mean_viol_loss = 0.0
         mean_cost_return = 0.0
         mean_cost_violation = 0.0
 
         # generator for mini batches
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
 
@@ -101,19 +115,24 @@ class PPOLagrange(PPO):
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
+            *_,
         ) in generator:
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1e-8
+                    )
                     if self.normalize_cost_advantage:
-                        cost_advantages_batch = (cost_advantages_batch - cost_advantages_batch.mean()) / (
-                            cost_advantages_batch.std() + 1e-8
-                        )
+                        cost_advantages_batch = (
+                            cost_advantages_batch - cost_advantages_batch.mean()
+                        ) / (cost_advantages_batch.std() + 1e-8)
 
             # Actor and critic forward pass
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(
+                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+            )
             cost_value_batch = self.policy.evaluate_cost(
                 critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[2]
             )
@@ -129,7 +148,7 @@ class PPOLagrange(PPO):
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
-                        axis=-1,
+                        dim=-1,
                     )
                     kl_mean = torch.mean(kl)
                     if self.is_multi_gpu:
@@ -154,6 +173,10 @@ class PPOLagrange(PPO):
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
             cost_surrogate = (torch.squeeze(cost_advantages_batch) * ratio).mean()
+            batch_cost_return, batch_cost_violation, c_hat_batch = self._batch_cost_stats(
+                cost_returns_batch
+            )
+            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat_batch)
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -166,9 +189,9 @@ class PPOLagrange(PPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             if self.use_clipped_value_loss:
-                cost_value_clipped = cost_values_batch + (cost_value_batch - cost_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
+                cost_value_clipped = cost_values_batch + (
+                    cost_value_batch - cost_values_batch
+                ).clamp(-self.clip_param, self.clip_param)
                 cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
                 cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
@@ -178,6 +201,7 @@ class PPOLagrange(PPO):
             loss = (
                 surrogate_loss
                 + self.lagrange_multiplier * cost_surrogate
+                + viol_loss
                 + self.value_loss_coef * value_loss
                 + self.cost_value_loss_coef * cost_value_loss
                 - self.entropy_coef * entropy_batch.mean()
@@ -189,18 +213,21 @@ class PPOLagrange(PPO):
                 self.reduce_parameters()
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._step_constraint_scale()
 
             mean_value_loss += value_loss.item()
             mean_cost_value_loss += cost_value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
-            mean_cost_return += cost_returns_batch.mean().item()
-            mean_cost_violation += (cost_returns_batch > self.cost_limit).float().mean().item()
+            mean_viol_loss += viol_loss.item()
+            mean_cost_return += batch_cost_return.item()
+            mean_cost_violation += batch_cost_violation.item()
 
         mean_value_loss /= num_updates
         mean_cost_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_viol_loss /= num_updates
         mean_cost_return /= num_updates
         mean_cost_violation /= num_updates
 
@@ -223,6 +250,8 @@ class PPOLagrange(PPO):
             "mean_cost_return": mean_cost_return,
             "cost_limit_margin": self.cost_limit - mean_cost_return,
             "cost_violation_rate": mean_cost_violation,
+            "viol_loss": mean_viol_loss,
+            "k_value": self.k_value,
             "lagrange_multiplier": self.lagrange_multiplier.item(),
         }
 
@@ -233,4 +262,5 @@ class PPOLagrange(PPO):
             "cost_value_function": mean_cost_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "viol": mean_viol_loss,
         }

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import torch
@@ -9,6 +8,7 @@ from isaaclab.managers import RewardManager
 if TYPE_CHECKING:
     from crl_isaaclab.envs import CRLManagerBasedRLEnv
 
+
 class CRLRewardManager(RewardManager):
     _env: CRLManagerBasedRLEnv
 
@@ -17,7 +17,7 @@ class CRLRewardManager(RewardManager):
 
     def compute(self, dt: float) -> torch.Tensor:
         """
-        Same to Legged Gym 
+        Same to Legged Gym
         """
         # reset computation
         self._reward_buf[:] = 0.0

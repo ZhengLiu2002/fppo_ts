@@ -30,15 +30,21 @@ def terrain_levels_vel(
     terrain: TerrainImporter = env.scene.terrain
     command = env.command_manager.get_command("base_velocity")
 
-    distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
+    distance = torch.norm(
+        asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
+    )
     # 更宽松的晋级阈值，鼓励更快推进地形关卡
-    move_up = distance > terrain.cfg.terrain_generator.size[0] * 0.35
+    move_up = distance > terrain.cfg.terrain_generator.size[0] * 0.25
     # 放宽降级条件，避免频繁回退
     move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.3
     move_down *= ~move_up
     if episodes_per_level is not None and episodes_per_level > 0:
         max_episode_length = env.max_episode_length
-        min_steps = (terrain.terrain_levels[env_ids].float() + 1.0) * max_episode_length * episodes_per_level
+        min_steps = (
+            (terrain.terrain_levels[env_ids].float() + 1.0)
+            * max_episode_length
+            * episodes_per_level
+        )
         move_up &= env.common_step_counter > min_steps
 
     terrain.update_env_origins(env_ids, move_up, move_down)
@@ -56,9 +62,9 @@ def lin_vel_x_command_threshold(
     lin_x_level_step = max(lin_x_level_step, 0.0)
 
     lin_x_level = max(0.0, min(lin_x_level, max_lin_x_level))
-    if (env.common_step_counter > ((lin_x_level + 1.0) * max_episode_length * episodes_per_level)) and (
-        lin_x_level < max_lin_x_level
-    ):
+    if (
+        env.common_step_counter > ((lin_x_level + 1.0) * max_episode_length * episodes_per_level)
+    ) and (lin_x_level < max_lin_x_level):
         if lin_x_level_step > 0.0:
             lin_x_level = min(lin_x_level + lin_x_level_step, max_lin_x_level)
         else:
@@ -95,9 +101,9 @@ def ang_vel_z_command_threshold(
     ang_z_level_step = max(ang_z_level_step, 0.0)
 
     ang_z_level = max(0.0, min(ang_z_level, max_ang_z_level))
-    if (env.common_step_counter > ((ang_z_level + 1.0) * max_episode_length * episodes_per_level)) and (
-        ang_z_level < max_ang_z_level
-    ):
+    if (
+        env.common_step_counter > ((ang_z_level + 1.0) * max_episode_length * episodes_per_level)
+    ) and (ang_z_level < max_ang_z_level):
         if ang_z_level_step > 0.0:
             ang_z_level = min(ang_z_level + ang_z_level_step, max_ang_z_level)
         else:

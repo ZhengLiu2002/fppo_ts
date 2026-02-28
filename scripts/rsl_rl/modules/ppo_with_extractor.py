@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import torch
@@ -9,8 +8,10 @@ from tensordict import TensorDict
 from .actor_critic_with_encoder import ActorCriticRMA
 from scripts.rsl_rl.algorithms import PPO
 
+
 class PPOWithExtractor(PPO):
     """带特权状态估计器与历史对齐正则的 PPO。"""
+
     policy: ActorCriticRMA
 
     def __init__(
@@ -37,13 +38,13 @@ class PPOWithExtractor(PPO):
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
-        priv_reg_coef_schedual = [0, 0, 0],
+        priv_reg_coef_schedual=[0, 0, 0],
         multi_gpu_cfg: dict | None = None,
         # FPPO/CMDP extras (ignored for PPO)
         **kwargs,
     ):
         super().__init__(
-            policy, 
+            policy,
             num_learning_epochs,
             num_mini_batches,
             clip_param,
@@ -64,7 +65,7 @@ class PPOWithExtractor(PPO):
             symmetry_cfg,
             # Distributed training parameters
             multi_gpu_cfg,
-            )
+        )
 
         self.estimator: nn.Module = estimator
         print(f"estimator MLP: {estimator}")
@@ -77,7 +78,9 @@ class PPOWithExtractor(PPO):
         self.num_scan = estimator_paras["num_scan"]
         estimator_params = list(self.estimator.parameters())
         self.estimator_optimizer = (
-            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"]) if estimator_params else None
+            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"])
+            if estimator_params
+            else None
         )
         self.train_with_estimated_states = estimator_paras["train_with_estimated_states"]
         hist_params = list(self.policy.actor.history_encoder.parameters())
@@ -88,11 +91,20 @@ class PPOWithExtractor(PPO):
         self.counter = 0
         # No MoE/gating in FPPO-TS
 
-
-    def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, privileged_obs=None, actions_shape=None):
+    def init_storage(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        obs,
+        privileged_obs=None,
+        actions_shape=None,
+    ):
         """Accept legacy signature and create storage compatible with rsl-rl>=3.1."""
         if actions_shape is None:
-            actions_shape = (self.policy.num_actions,) if hasattr(self.policy, "num_actions") else (1,)
+            actions_shape = (
+                (self.policy.num_actions,) if hasattr(self.policy, "num_actions") else (1,)
+            )
         if isinstance(actions_shape, list):
             actions_shape = tuple(actions_shape)
         if isinstance(obs, TensorDict):
@@ -106,7 +118,9 @@ class PPOWithExtractor(PPO):
                 priv_tensor = torch.zeros((num_envs, *privileged_obs), device=self.device)
                 obs_dict["critic_obs"] = priv_tensor
             obs_td = TensorDict(obs_dict, batch_size=[num_envs], device=self.device)
-        super().init_storage(training_type, num_envs, num_transitions_per_env, obs_td, actions_shape)
+        super().init_storage(
+            training_type, num_envs, num_transitions_per_env, obs_td, actions_shape
+        )
 
     def act(self, obs, critic_obs, hist_encoding=False):
         """采样动作并缓存过渡，用估计器可选替换特权显式段。"""
@@ -118,7 +132,7 @@ class PPOWithExtractor(PPO):
         # compute the actions and values
         if self.train_with_estimated_states:
             obs_est = obs.clone()
-            priv_states_estimated = self.estimator(obs_est[:, :self.num_prop])
+            priv_states_estimated = self.estimator(obs_est[:, : self.num_prop])
             start = self.num_prop + self.num_scan + self.num_priv_hurdles
             end = self.num_prop + self.num_scan + self.priv_states_dim
             if self.priv_states_dim_other > 0:
@@ -128,7 +142,9 @@ class PPOWithExtractor(PPO):
             self.transition.actions = self.policy.act(obs, hist_encoding).detach()
 
         self.transition.values = self.policy.evaluate(critic_obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(
+            self.transition.actions
+        ).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
@@ -172,7 +188,10 @@ class PPOWithExtractor(PPO):
     def compute_returns(self, critic_obs):
         last_values = self.policy.evaluate(critic_obs).detach()
         self.storage.compute_returns(
-            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+            last_values,
+            self.gamma,
+            self.lam,
+            normalize_advantage=not self.normalize_advantage_per_mini_batch,
         )
 
     def broadcast_parameters(self):
@@ -207,7 +226,6 @@ class PPOWithExtractor(PPO):
                 if param.grad is not None:
                     torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
                     param.grad /= self.gpu_world_size
-    
 
     def update(self):  # noqa: C901
         """PPO 主更新：含特权正则、状态估计、可选对称/RND。"""
@@ -229,9 +247,13 @@ class PPOWithExtractor(PPO):
 
         # generator for mini batches
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
 
         # iterate over batches (handle both legacy and current rollout generators)
         for batch in generator:
@@ -280,7 +302,9 @@ class PPOWithExtractor(PPO):
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1e-8
+                    )
 
             # zero grads for all optimizers before computing losses
             self.optimizer.zero_grad()
@@ -295,7 +319,10 @@ class PPOWithExtractor(PPO):
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # returned shape: [batch_size * num_aug, ...]
                 obs_batch, actions_batch = data_augmentation_func(
-                    obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
+                    obs=obs_batch,
+                    actions=actions_batch,
+                    env=self.symmetry["_env"],
+                    obs_type="policy",
                 )
                 critic_obs_batch, _ = data_augmentation_func(
                     obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
@@ -316,7 +343,9 @@ class PPOWithExtractor(PPO):
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(
+                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+            )
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
@@ -325,11 +354,20 @@ class PPOWithExtractor(PPO):
             with torch.inference_mode():
                 hist_latent_batch = self.policy.actor.infer_hist_latent(obs_batch)
             priv_reg_loss = (priv_latent_batch - hist_latent_batch.detach()).norm(p=2, dim=1).mean()
-            priv_reg_stage = min(max((self.counter - self.priv_reg_coef_schedual[2]), 0) / self.priv_reg_coef_schedual[3], 1)
-            priv_reg_coef = priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0]) + self.priv_reg_coef_schedual[0]
+            priv_reg_stage = min(
+                max((self.counter - self.priv_reg_coef_schedual[2]), 0)
+                / self.priv_reg_coef_schedual[3],
+                1,
+            )
+            priv_reg_coef = (
+                priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0])
+                + self.priv_reg_coef_schedual[0]
+            )
 
             # Estimator
-            priv_states_predicted = self.estimator(obs_batch[:, :self.num_prop])  # batch 中原始 priv_states 仍保留
+            priv_states_predicted = self.estimator(
+                obs_batch[:, : self.num_prop]
+            )  # batch 中原始 priv_states 仍保留
             start = self.num_prop + self.num_scan + self.num_priv_hurdles
             end = self.num_prop + self.num_scan + self.priv_states_dim
             if self.priv_states_dim_other > 0:
@@ -344,7 +382,7 @@ class PPOWithExtractor(PPO):
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
-                        axis=-1,
+                        dim=-1,
                     )
                     kl_mean = torch.mean(kl)
 
@@ -392,11 +430,12 @@ class PPOWithExtractor(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + \
-                self.value_loss_coef * value_loss -\
-                self.entropy_coef * entropy_batch.mean() + \
-                priv_reg_coef * priv_reg_loss
-
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                - self.entropy_coef * entropy_batch.mean()
+                + priv_reg_coef * priv_reg_loss
+            )
 
             # Symmetry loss
             if self.symmetry:
@@ -425,7 +464,8 @@ class PPOWithExtractor(PPO):
                 # compute the loss (we skip the first augmentation as it is the original one)
                 mse_loss = torch.nn.MSELoss()
                 symmetry_loss = mse_loss(
-                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+                    mean_actions_batch[original_batch_size:],
+                    actions_mean_symm_batch.detach()[original_batch_size:],
                 )
                 # add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
@@ -443,7 +483,6 @@ class PPOWithExtractor(PPO):
                 # compute the loss as the mean squared error
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
-
 
             if self.estimator_optimizer is not None:
                 estimator_loss.backward()
@@ -500,8 +539,8 @@ class PPOWithExtractor(PPO):
             "surrogate": mean_surrogate_loss,
             "priv_reg": mean_priv_reg_loss,
             "entropy": mean_entropy,
-            'estimator':mean_estimator_loss,
-            'priv_reg_coef': priv_reg_coef
+            "estimator": mean_estimator_loss,
+            "priv_reg_coef": priv_reg_coef,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -516,9 +555,13 @@ class PPOWithExtractor(PPO):
         """DAgger 式自蒸馏：强制历史编码对齐特权隐式编码。"""
         mean_hist_latent_loss = 0
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         for batch in generator:
             if len(batch) == 10:
                 (
@@ -555,20 +598,26 @@ class PPOWithExtractor(PPO):
                     critic_obs_batch = obs_batch.get("critic_obs", obs_batch.get("obs"))
                     obs_batch = obs_batch.get("obs")
             with torch.inference_mode():
-                self.policy.act(obs_batch, 
-                                hist_encoding=True, 
-                                masks=masks_batch, 
-                                hidden_states=hid_states_batch[0])
+                self.policy.act(
+                    obs_batch,
+                    hist_encoding=True,
+                    masks=masks_batch,
+                    hidden_states=hid_states_batch[0],
+                )
 
             # Adaptation module update
             with torch.inference_mode():
                 priv_latent_batch = self.policy.actor.infer_priv_latent(obs_batch)
             hist_latent_batch = self.policy.actor.infer_hist_latent(obs_batch)
-            hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
+            hist_latent_loss = (
+                (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
+            )
             if self.hist_encoder_optimizer is not None:
                 self.hist_encoder_optimizer.zero_grad()
                 hist_latent_loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.actor.history_encoder.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    self.policy.actor.history_encoder.parameters(), self.max_grad_norm
+                )
                 self.hist_encoder_optimizer.step()
             mean_hist_latent_loss += hist_latent_loss.item()
         num_updates = self.num_learning_epochs * self.num_mini_batches

@@ -15,12 +15,13 @@ from isaaclab.managers import CommandManager, CurriculumManager, TerminationMana
 from isaaclab.envs.common import VecEnvStepReturn
 from collections.abc import Sequence
 from typing import Any, ClassVar
-import math, torch   
-import numpy as np 
+import math, torch
+import numpy as np
 from crl_isaaclab.managers.crl_reward_manager import CRLRewardManager
 
+
 class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
-    is_vector_env: ClassVar[bool] = True 
+    is_vector_env: ClassVar[bool] = True
     metadata: ClassVar[dict[str, Any]] = {
         "render_modes": [None, "human", "rgb_array"],
         "isaac_sim_version": get_version(),
@@ -43,7 +44,7 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
         # note: this order is important since observation manager needs to know the command and action managers
         # and the reward manager needs to know the termination manager
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        
+
         # -- command manager
 
         self.command_manager: CommandManager = CommandManager(self.cfg.commands, self)
@@ -103,8 +104,9 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             "reward_manager": ManagerLiveVisualizer(manager=self.reward_manager),
         }
         if self.crl_manager is not None:
-            self.manager_visualizers["crl_manager"] = ManagerLiveVisualizer(manager=self.crl_manager)
-
+            self.manager_visualizers["crl_manager"] = ManagerLiveVisualizer(
+                manager=self.crl_manager
+            )
 
     @property
     def max_episode_length_s(self) -> float:
@@ -115,7 +117,7 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
     def max_episode_length(self) -> int:
         """Maximum episode length in environment steps."""
         return math.ceil(self.max_episode_length_s / self.step_dt)
-    
+
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         # process actions
         self.action_manager.process_action(action.to(self.device))
@@ -137,7 +139,7 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
                 self.sim.render()
             self.scene.update(dt=self.physics_dt)
-        
+
         if self.crl_manager is not None:
             self.crl_manager.compute(dt=self.step_dt)
         # post-step:
@@ -163,14 +165,14 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             else:
                 cost_terms = self._collect_cost_terms()
                 self.extras["cost"] = cost_terms if cost_terms is not None else cost
-        
+
         if len(self.recorder_manager.active_terms) > 0:
             # update observations for recording if needed
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
 
         # -- reset envs that terminated/timed-out and log the episode information
-        
+
         if len(reset_env_ids) > 0:
             # trigger recorder terms for pre-reset calls
             self.recorder_manager.record_pre_reset(reset_env_ids)
@@ -203,7 +205,13 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             self.extras["log"] = dict()
         # note: terrain level hist/mean logging removed to reduce duplicate console/W&B noise
         # return observations, rewards, resets and extras
-        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+        return (
+            self.obs_buf,
+            self.reward_buf,
+            self.reset_terminated,
+            self.reset_time_outs,
+            self.extras,
+        )
 
     def render(self, recompute: bool = False) -> np.ndarray | None:
         # run a rendering step of the simulator
@@ -240,7 +248,10 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             # return the rgb data
             # note: initially the renerer is warming up and returns empty data
             if rgb_data.size == 0:
-                return np.zeros((self.cfg.viewer.resolution[1], self.cfg.viewer.resolution[0], 3), dtype=np.uint8)
+                return np.zeros(
+                    (self.cfg.viewer.resolution[1], self.cfg.viewer.resolution[0], 3),
+                    dtype=np.uint8,
+                )
             else:
                 return rgb_data[:, :, :3]
         else:
@@ -269,18 +280,24 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
             # check if group is concatenated or not
             # if not concatenated, then we need to add each term separately as a dictionary
             if has_concatenated_obs:
-                self.single_observation_space[group_name] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=group_dim)
+                self.single_observation_space[group_name] = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=group_dim
+                )
             else:
-                self.single_observation_space[group_name] = gym.spaces.Dict({
-                    term_name: gym.spaces.Box(low=-np.inf, high=np.inf, shape=term_dim)
-                    for term_name, term_dim in zip(group_term_names, group_dim)
-                })
+                self.single_observation_space[group_name] = gym.spaces.Dict(
+                    {
+                        term_name: gym.spaces.Box(low=-np.inf, high=np.inf, shape=term_dim)
+                        for term_name, term_dim in zip(group_term_names, group_dim)
+                    }
+                )
         # action space (unbounded since we don't impose any limits)
         action_dim = sum(self.action_manager.action_term_dim)
         self.single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(action_dim,))
 
         # batch the spaces for vectorized environments
-        self.observation_space = gym.vector.utils.batch_space(self.single_observation_space, self.num_envs)
+        self.observation_space = gym.vector.utils.batch_space(
+            self.single_observation_space, self.num_envs
+        )
         self.action_space = gym.vector.utils.batch_space(self.single_action_space, self.num_envs)
 
     def _reset_idx(self, env_ids: Sequence[int]):
@@ -301,7 +318,9 @@ class CRLManagerBasedRLEnv(CRLManagerBasedEnv, gym.Env):
         # apply events such as randomizations for environments that need a reset
         if "reset" in self.event_manager.available_modes:
             env_step_count = self._sim_step_counter // self.cfg.decimation
-            self.event_manager.apply(mode="reset", env_ids=env_ids, global_env_step_count=env_step_count)
+            self.event_manager.apply(
+                mode="reset", env_ids=env_ids, global_env_step_count=env_step_count
+            )
 
         # iterate over all managers and reset them
         # this returns a dictionary of information which is stored in the extras

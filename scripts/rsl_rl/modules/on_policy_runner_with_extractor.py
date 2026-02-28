@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -10,6 +9,7 @@ from collections import deque
 
 import rsl_rl
 from rsl_rl.env import VecEnv
+
 try:
     from rsl_rl.modules import EmpiricalNormalization  # type: ignore
 except ImportError:
@@ -47,29 +47,39 @@ except ImportError:
 
             std = torch.sqrt(self.var + 1e-8)
             return (x - self.mean) / std
+
+
 from .actor_critic_with_encoder import ActorCriticRMA
 from rsl_rl.utils import store_code_state
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
-from scripts.rsl_rl.algorithms import PPO as AlgoPPO
-from scripts.rsl_rl.algorithms import FPPO as AlgoFPPO
-from scripts.rsl_rl.algorithms import PPOLagrange as AlgoPPOLagrange
-from scripts.rsl_rl.algorithms import CPO as AlgoCPO
-from scripts.rsl_rl.algorithms import PCPO as AlgoPCPO
-from scripts.rsl_rl.algorithms import FOCPO as AlgoFOCPO
-from scripts.rsl_rl.algorithms import Distillation as AlgoDistillation
+from scripts.rsl_rl.algorithms.registry import (
+    get_algorithm_class,
+    get_algorithm_spec,
+    strict_algorithm_cfg_enabled,
+    validate_algorithm_cfg,
+)
 from scripts.rsl_rl.constraint_utils import ConstraintNormalizer
 
-# Expose algorithm classes to eval() for backwards compatibility
-PPO = AlgoPPO
-FPPO = AlgoFPPO
-PPOLagrange = AlgoPPOLagrange
-CPO = AlgoCPO
-PCPO = AlgoPCPO
-FOCPO = AlgoFOCPO
-Distillation = AlgoDistillation
+_RUNNER_ONLY_ALG_KEYS = {
+    "class_name",
+    "dagger_update_freq",
+    "rnd_cfg",
+    "symmetry_cfg",
+    "constraint_normalization",
+    "constraint_norm_beta",
+    "constraint_norm_min_scale",
+    "constraint_norm_max_scale",
+    "constraint_norm_clip",
+    "constraint_proxy_delta",
+    "constraint_agg_tau",
+    "constraint_scale_by_gamma",
+    "constraint_cost_scale",
+}
+
 
 class OnPolicyRunnerWithExtractor(OnPolicyRunner):
     """纯算法训练 Runner，支持 PPO/FPPO/CPO/Distillation 等流程。"""
+
     @staticmethod
     def _expected_obs_dim(policy_cfg: dict) -> int | None:
         num_prop = policy_cfg.get("num_prop", None)
@@ -94,28 +104,28 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
-        self.mean_hist_latent_loss = 0.
+        self.mean_hist_latent_loss = 0.0
         self._configure_multi_gpu()
         self._constraint_normalizer = None
-        self._constraint_scale_by_gamma = bool(self.alg_cfg_full.get("constraint_scale_by_gamma", False))
+        self._constraint_scale_by_gamma = bool(
+            self.alg_cfg_full.get("constraint_scale_by_gamma", False)
+        )
         self._constraint_scale = self.alg_cfg_full.get("constraint_cost_scale", None)
         self._constraint_gamma = self.alg_cfg_full.get("cost_gamma")
         if self._constraint_gamma is None:
             self._constraint_gamma = self.alg_cfg_full.get("gamma")
         if self.alg_cfg_full.get("constraint_normalization", False):
-            self._constraint_normalizer = ConstraintNormalizer.from_cfg(self.alg_cfg_full, device=self.device)
+            self._constraint_normalizer = ConstraintNormalizer.from_cfg(
+                self.alg_cfg_full, device=self.device
+            )
 
         alg_class_name = self.alg_cfg["class_name"]
-        if alg_class_name in ("PPO", "FPPO", "PPOLagrange", "CPO", "PCPO", "FOCPO"):
-            self.training_type = "rl"
-        elif alg_class_name == "Distillation":
-            self.training_type = "distillation"
-        else:
-            raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
+        alg_spec = get_algorithm_spec(alg_class_name)
+        self.training_type = alg_spec.training_type
 
         obs, extras = self.env.get_observations()
         num_obs = obs.shape[1]
-        
+
         if self.training_type == "rl":
             if "critic" in extras["observations"]:
                 self.privileged_obs_type = "critic"  # actor-critic 强化学习模式（例如 PPO）
@@ -151,7 +161,11 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 "num_hist": self.policy_cfg.get("critic_num_hist", 0),
             }
         )
-        if expected_critic is not None and self.privileged_obs_type is not None and num_privileged_obs != expected_critic:
+        if (
+            expected_critic is not None
+            and self.privileged_obs_type is not None
+            and num_privileged_obs != expected_critic
+        ):
             raise ValueError(
                 f"Critic obs dim mismatch: env provides {num_privileged_obs}, "
                 f"but policy_cfg expects {expected_critic} "
@@ -163,14 +177,16 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             )
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCriticRMA = policy_class(
-                                             num_privileged_obs, self.env.num_actions, **self.policy_cfg
-                                            ).to(self.device)
+            num_privileged_obs, self.env.num_actions, **self.policy_cfg
+        ).to(self.device)
 
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             # check if rnd gated state is present
             rnd_state = extras["observations"].get("rnd_state")
             if rnd_state is None:
-                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
+                raise ValueError(
+                    "Observations for the key 'rnd_state' not found in infos['observations']."
+                )
             # get dimension of rnd gated state
             num_rnd_state = rnd_state.shape[1]
             # add rnd gated state to config
@@ -191,18 +207,29 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             return {k: v for k, v in cfg_dict.items() if k in allowed}
 
         if self.estimator_cfg is not None or self.depth_encoder_cfg is not None:
-            raise ValueError("Estimator/depth encoder configs are set, but this runner uses pure algorithms only.")
+            raise ValueError(
+                "Estimator/depth encoder configs are set, but this runner uses pure algorithms only."
+            )
         self.learn = self.learn_rl
 
         # 纯算法训练
         alg_cfg = dict(self.alg_cfg)
         alg_cfg.pop("class_name", None)
         self.dagger_update_freq = alg_cfg.pop("dagger_update_freq", 1)
-        alg_class = eval(alg_class_name)
+        alg_class = get_algorithm_class(alg_class_name)
+        validate_algorithm_cfg(
+            alg_class,
+            self.alg_cfg_full,
+            extra_allowed_keys=_RUNNER_ONLY_ALG_KEYS | set(alg_spec.extra_cfg_keys),
+            strict=strict_algorithm_cfg_enabled(),
+        )
         alg_kwargs = _filter_kwargs(alg_class, alg_cfg)
         if "device" not in alg_kwargs:
             alg_kwargs["device"] = self.device
-        if "multi_gpu_cfg" in inspect.signature(alg_class.__init__).parameters and "multi_gpu_cfg" not in alg_kwargs:
+        if (
+            "multi_gpu_cfg" in inspect.signature(alg_class.__init__).parameters
+            and "multi_gpu_cfg" not in alg_kwargs
+        ):
             alg_kwargs["multi_gpu_cfg"] = self.multi_gpu_cfg
         self.alg = alg_class(policy=policy, **alg_kwargs)
 
@@ -211,10 +238,12 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         self.empirical_normalization = self.cfg["empirical_normalization"]
 
         if self.empirical_normalization:
-            self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
-            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
+            self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(
                 self.device
             )
+            self.privileged_obs_normalizer = EmpiricalNormalization(
+                shape=[num_privileged_obs], until=1.0e8
+            ).to(self.device)
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
@@ -236,7 +265,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn_rl(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+    def learn_rl(
+        self, num_learning_iterations: int, init_at_random_ep_len: bool = False
+    ):  # noqa: C901
         """标准 RL 训练循环：收集 rollout -> 更新 PPO -> 记录日志。"""
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -247,7 +278,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
-                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer = NeptuneSummaryWriter(
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                )
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
@@ -259,7 +292,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
-                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+                raise ValueError(
+                    "Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'."
+                )
 
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -310,7 +345,11 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    obs, rewards, dones = (
+                        obs.to(self.device),
+                        rewards.to(self.device),
+                        dones.to(self.device),
+                    )
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -325,7 +364,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                     self.alg.process_env_step(obs, rewards, dones, infos, costs=costs)
 
                     # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if getattr(self.alg, "rnd", None) else None
+                    intrinsic_rewards = (
+                        self.alg.intrinsic_rewards if getattr(self.alg, "rnd", None) else None
+                    )
 
                     # book keeping
                     if self.log_dir is not None:
@@ -369,7 +410,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             if hist_encoding and hasattr(self.alg, "update_dagger"):
                 print("Updating dagger...")
                 self.mean_hist_latent_loss = self.alg.update_dagger()
-            loss_dict['hist_latent'] = self.mean_hist_latent_loss
+            loss_dict["hist_latent"] = self.mean_hist_latent_loss
 
             stop = time.time()
             learn_time = stop - start
@@ -412,7 +453,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
-            saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
+            saved_dict["privileged_obs_norm_state_dict"] = (
+                self.privileged_obs_normalizer.state_dict()
+            )
         # save model
         torch.save(saved_dict, path)
 
@@ -428,7 +471,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         if self.empirical_normalization:
             if resumed_training:
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+                self.privileged_obs_normalizer.load_state_dict(
+                    loaded_dict["privileged_obs_norm_state_dict"]
+                )
             else:
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
         if load_optimizer and resumed_training:
@@ -509,15 +554,25 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         if len(locs["rewbuffer"]) > 0:
             # Separate logging for intrinsic and extrinsic rewards
             if hasattr(self.alg, "rnd") and self.alg.rnd:
-                self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
-                self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
+                self.writer.add_scalar(
+                    "Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"]
+                )
+                self.writer.add_scalar(
+                    "Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"]
+                )
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # Everything else
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            self.writer.add_scalar(
+                "Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"]
+            )
+            self.writer.add_scalar(
+                "Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"]
+            )
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar(
-                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                    "Train/mean_episode_length/time",
+                    statistics.mean(locs["lenbuffer"]),
+                    self.tot_time,
                 )
 
         # Terminal log
@@ -534,7 +589,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             log_string += cost_string
         if len(locs["rewbuffer"]) > 0:
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
-            log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+            log_string += (
+                f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+            )
         log_string += ep_string
         log_string += (
             f"""{'-' * width}\n"""
@@ -553,7 +610,8 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             return optimizer.state_dict()
         if isinstance(optimizer, dict):
             return {
-                key: opt.state_dict() if hasattr(opt, "state_dict") else opt for key, opt in optimizer.items()
+                key: opt.state_dict() if hasattr(opt, "state_dict") else opt
+                for key, opt in optimizer.items()
             }
         if isinstance(optimizer, (list, tuple)):
             return [opt.state_dict() if hasattr(opt, "state_dict") else opt for opt in optimizer]

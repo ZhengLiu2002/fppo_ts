@@ -1,11 +1,9 @@
-
-
 from __future__ import annotations
 
 import torch
 from typing import TYPE_CHECKING, Literal
 import omni.usd
-from isaaclab.assets import RigidObject,Articulation, AssetBase
+from isaaclab.assets import RigidObject, Articulation, AssetBase
 from isaaclab.managers import SceneEntityCfg, ManagerTermBase
 import isaaclab.utils.math as math_utils
 from isaaclab.envs.mdp.events import _randomize_prop_by_op
@@ -15,8 +13,9 @@ from isaaclab.sensors import RayCasterCamera
 from isaaclab.utils.math import quat_from_euler_xyz
 
 if TYPE_CHECKING:
-    from isaaclab.envs import  ManagerBasedEnv
+    from isaaclab.envs import ManagerBasedEnv
     from isaaclab.managers import EventTermCfg
+
 
 def reset_joints_by_offset(
     env: ManagerBasedEnv,
@@ -62,8 +61,13 @@ def reset_root_state(
     positions[:, 0] -= float(offset)
     if height_offset != 0.0:
         positions[:, 2] += float(height_offset)
-    asset.write_root_pose_to_sim(torch.cat([positions, root_states[:, 3:7]], dim=-1), env_ids=env_ids)
-    asset.write_root_velocity_to_sim(root_states[:, 7:13] , env_ids=env_ids) ## it mush need for init vel
+    asset.write_root_pose_to_sim(
+        torch.cat([positions, root_states[:, 3:7]], dim=-1), env_ids=env_ids
+    )
+    asset.write_root_velocity_to_sim(
+        root_states[:, 7:13], env_ids=env_ids
+    )  ## it mush need for init vel
+
 
 def randomize_actuator_gains(
     env: ManagerBasedEnv,
@@ -81,7 +85,12 @@ def randomize_actuator_gains(
 
     def randomize(data: torch.Tensor, params: tuple[float, float]) -> torch.Tensor:
         return _randomize_prop_by_op(
-            data, params, dim_0_ids=None, dim_1_ids=actuator_indices, operation=operation, distribution=distribution
+            data,
+            params,
+            dim_0_ids=None,
+            dim_1_ids=actuator_indices,
+            operation=operation,
+            distribution=distribution,
         )
 
     for actuator in asset.actuators.values():
@@ -92,30 +101,43 @@ def randomize_actuator_gains(
             else:
                 global_indices = torch.tensor(actuator.joint_indices, device=asset.device)
         elif isinstance(actuator.joint_indices, slice):
-            global_indices = actuator_indices = torch.tensor(asset_cfg.joint_ids, device=asset.device)
+            global_indices = actuator_indices = torch.tensor(
+                asset_cfg.joint_ids, device=asset.device
+            )
         else:
             actuator_joint_indices = torch.tensor(actuator.joint_indices, device=asset.device)
             asset_joint_ids = torch.tensor(asset_cfg.joint_ids, device=asset.device)
             # the indices of the joints in the actuator that have to be randomized
-            actuator_indices = torch.nonzero(torch.isin(actuator_joint_indices, asset_joint_ids)).view(-1)
+            actuator_indices = torch.nonzero(
+                torch.isin(actuator_joint_indices, asset_joint_ids)
+            ).view(-1)
             if len(actuator_indices) == 0:
                 continue
             global_indices = actuator_joint_indices[actuator_indices]
         if stiffness_distribution_params is not None:
             stiffness = actuator.stiffness[env_ids].clone()
-            stiffness[:, actuator_indices] = asset.data.default_joint_stiffness[env_ids][:, global_indices].clone()
+            stiffness[:, actuator_indices] = asset.data.default_joint_stiffness[env_ids][
+                :, global_indices
+            ].clone()
             randomize(stiffness, stiffness_distribution_params)
             actuator.stiffness[env_ids] = stiffness
             if isinstance(actuator, DCMotor) or isinstance(actuator, CRLDCMotor):
-                asset.write_joint_stiffness_to_sim(stiffness, joint_ids=actuator.joint_indices, env_ids=env_ids)
+                asset.write_joint_stiffness_to_sim(
+                    stiffness, joint_ids=actuator.joint_indices, env_ids=env_ids
+                )
         # Randomize damping
         if damping_distribution_params is not None:
             damping = actuator.damping[env_ids].clone()
-            damping[:, actuator_indices] = asset.data.default_joint_damping[env_ids][:, global_indices].clone()
+            damping[:, actuator_indices] = asset.data.default_joint_damping[env_ids][
+                :, global_indices
+            ].clone()
             randomize(damping, damping_distribution_params)
             actuator.damping[env_ids] = damping
             if isinstance(actuator, DCMotor) or isinstance(actuator, CRLDCMotor):
-                asset.write_joint_damping_to_sim(damping, joint_ids=actuator.joint_indices, env_ids=env_ids)
+                asset.write_joint_damping_to_sim(
+                    damping, joint_ids=actuator.joint_indices, env_ids=env_ids
+                )
+
 
 def randomize_rigid_body_com(
     env: ManagerBasedEnv,
@@ -151,40 +173,48 @@ def randomize_rigid_body_com(
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
 
+
 def push_by_setting_velocity(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     velocity_range: dict[str, tuple[float, float]],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-):  
+):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
     vel_w = asset.data.root_vel_w[env_ids]
-    range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    range_list = [
+        velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+    ]
     ranges = torch.tensor(range_list, device=asset.device)
-    random_noise = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], vel_w.shape, device=asset.device)
-    vel_w[:,:2] = random_noise[:,:2]
-    vel_w[:,2:] += random_noise[:,2:]
+    random_noise = math_utils.sample_uniform(
+        ranges[:, 0], ranges[:, 1], vel_w.shape, device=asset.device
+    )
+    vel_w[:, :2] = random_noise[:, :2]
+    vel_w[:, 2:] += random_noise[:, 2:]
     asset.write_root_velocity_to_sim(vel_w, env_ids=env_ids)
+
 
 def random_camera_position(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
     sensor_cfg: SceneEntityCfg,
-    pos_noise_range: dict[str,tuple[float,float]] | None = None,
-    rot_noise_range: dict[str,tuple[float,float]] | None = None,
-    convention: str = 'ros',
+    pos_noise_range: dict[str, tuple[float, float]] | None = None,
+    rot_noise_range: dict[str, tuple[float, float]] | None = None,
+    convention: str = "ros",
 ):
     """
     prestartup
     """
     camera_sensor: RayCasterCamera = env.scene.sensors[sensor_cfg.name]
 
-    init_rot = torch.tensor(camera_sensor.cfg.offset.rot).repeat(env.num_envs,1).to(env.device)
+    init_rot = torch.tensor(camera_sensor.cfg.offset.rot).repeat(env.num_envs, 1).to(env.device)
 
-    if pos_noise_range is not None: 
+    if pos_noise_range is not None:
         pos_range_list = [pos_noise_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
         pos_ranges = torch.tensor(pos_range_list, device=env.device)
-        random_pose = math_utils.sample_uniform(pos_ranges[:,0], pos_ranges[:,1], (env.num_envs,1), device=env.device)
+        random_pose = math_utils.sample_uniform(
+            pos_ranges[:, 0], pos_ranges[:, 1], (env.num_envs, 1), device=env.device
+        )
     else:
         random_pose = None
     if rot_noise_range is not None:
@@ -192,10 +222,12 @@ def random_camera_position(
         rot_ranges = torch.deg2rad(torch.tensor(rot_range_list)).to(env.device)
         roll, pitch, yaw = math_utils.euler_xyz_from_quat(init_rot)
         init_rot = torch.stack([roll, pitch, yaw], dim=-1).to(env.device)
-        init_rot += math_utils.sample_uniform(rot_ranges[:,0], rot_ranges[:,1], (env.num_envs,1), device=env.device)
-        random_rot = math_utils.quat_from_euler_xyz(init_rot[:,0],init_rot[:,1],init_rot[:,2])
+        init_rot += math_utils.sample_uniform(
+            rot_ranges[:, 0], rot_ranges[:, 1], (env.num_envs, 1), device=env.device
+        )
+        random_rot = math_utils.quat_from_euler_xyz(init_rot[:, 0], init_rot[:, 1], init_rot[:, 2])
     else:
-        random_rot = init_rot 
+        random_rot = init_rot
 
     camera_sensor.set_world_poses(
         positions=random_pose,
@@ -203,7 +235,8 @@ def random_camera_position(
         convention=convention,
         env_ids=torch.arange(env.num_envs, dtype=torch.int64, device=env.device),
     )
-    
+
+
 class randomize_rigid_body_material(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         """Initialize the term.
@@ -243,12 +276,14 @@ class randomize_rigid_body_material(ManagerTermBase):
 
         # obtain parameters for sampling friction and restitution values
         friction_range = cfg.params.get("friction_range", (1.0, 1.0))
-        restitution_range = cfg.params.get("restitution_range", (0.,0.))
+        restitution_range = cfg.params.get("restitution_range", (0.0, 0.0))
         num_buckets = int(cfg.params.get("num_buckets", 1))
-        range_list = [friction_range, (0,0), restitution_range]
+        range_list = [friction_range, (0, 0), restitution_range]
         ranges = torch.tensor(range_list, device="cpu")
-        self.material_buckets = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (num_buckets, 3), device="cpu")
-        self.material_buckets[:,1] = self.material_buckets[:,0]
+        self.material_buckets = math_utils.sample_uniform(
+            ranges[:, 0], ranges[:, 1], (num_buckets, 3), device="cpu"
+        )
+        self.material_buckets[:, 1] = self.material_buckets[:, 0]
 
     def __call__(
         self,
@@ -269,7 +304,7 @@ class randomize_rigid_body_material(ManagerTermBase):
         bucket_ids = torch.randint(0, num_buckets, (len(env_ids),), device="cpu")
         material_samples = self.material_buckets[bucket_ids]
         total_num_shapes = self.asset.root_physx_view.max_shapes
-        material_samples = material_samples.unsqueeze(1).repeat(1,total_num_shapes,1)
+        material_samples = material_samples.unsqueeze(1).repeat(1, total_num_shapes, 1)
         # retrieve material buffer from the physics simulation
         materials = self.asset.root_physx_view.get_material_properties()
         # update material buffer with new samples
@@ -280,7 +315,7 @@ class randomize_rigid_body_material(ManagerTermBase):
                 start_idx = sum(self.num_shapes_per_body[:body_id])
                 end_idx = start_idx + self.num_shapes_per_body[body_id]
                 # assign the new materials
-                # material samples are of shape: num_env_ids x total_num_shapes 
+                # material samples are of shape: num_env_ids x total_num_shapes
                 materials[env_ids, start_idx:end_idx] = material_samples[:, start_idx:end_idx]
         else:
             # assign all the materials

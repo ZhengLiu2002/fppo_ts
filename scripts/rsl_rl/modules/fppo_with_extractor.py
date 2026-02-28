@@ -115,7 +115,9 @@ class FPPOWithExtractor:
         self.feasible_first_coef = feasible_first_coef
 
         # Critic optimizer (reward + cost)
-        critic_params = list(self.policy.critic.parameters()) + list(self.policy.cost_critic.parameters())
+        critic_params = list(self.policy.critic.parameters()) + list(
+            self.policy.cost_critic.parameters()
+        )
         self.optimizer = optim.Adam(critic_params, lr=learning_rate)
 
         # Estimator / history encoder optimizers
@@ -127,7 +129,9 @@ class FPPOWithExtractor:
         self.num_scan = estimator_paras["num_scan"]
         estimator_params = list(self.estimator.parameters())
         self.estimator_optimizer = (
-            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"]) if estimator_params else None
+            optim.Adam(estimator_params, lr=estimator_paras["learning_rate"])
+            if estimator_params
+            else None
         )
         self.train_with_estimated_states = estimator_paras["train_with_estimated_states"]
         hist_params = list(self.policy.actor.history_encoder.parameters())
@@ -149,13 +153,25 @@ class FPPOWithExtractor:
         self._actor_params = self._get_actor_params()
         self._precond_v = None
         if self.use_preconditioner:
-            self._precond_v = [torch.zeros_like(param, device=self.device) for param in self._actor_params]
+            self._precond_v = [
+                torch.zeros_like(param, device=self.device) for param in self._actor_params
+            ]
 
         self.train_metrics: dict[str, float] = {}
 
-    def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, privileged_obs=None, actions_shape=None):
+    def init_storage(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        obs,
+        privileged_obs=None,
+        actions_shape=None,
+    ):
         if actions_shape is None:
-            actions_shape = (self.policy.actor.num_actions,) if hasattr(self.policy, "actor") else (1,)
+            actions_shape = (
+                (self.policy.actor.num_actions,) if hasattr(self.policy, "actor") else (1,)
+            )
         if isinstance(actions_shape, list):
             actions_shape = tuple(actions_shape)
         obs_shape = obs if isinstance(obs, (list, tuple)) else (obs,)
@@ -186,7 +202,9 @@ class FPPOWithExtractor:
 
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.cost_values = self.policy.evaluate_cost(critic_obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(
+            self.transition.actions
+        ).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         self.transition.observations = obs
@@ -205,8 +223,12 @@ class FPPOWithExtractor:
 
         if "time_outs" in infos:
             time_outs = infos["time_outs"].unsqueeze(1).to(self.device)
-            self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * time_outs, 1)
-            self.transition.cost_rewards += self.cost_gamma * torch.squeeze(self.transition.cost_values * time_outs, 1)
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * time_outs, 1
+            )
+            self.transition.cost_rewards += self.cost_gamma * torch.squeeze(
+                self.transition.cost_values * time_outs, 1
+            )
 
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -225,7 +247,8 @@ class FPPOWithExtractor:
             last_cost_values=last_cost_values,
             cost_gamma=self.cost_gamma,
             cost_lam=self.cost_lam,
-            normalize_cost_advantage=self.normalize_cost_advantage and not self.normalize_advantage_per_mini_batch,
+            normalize_cost_advantage=self.normalize_cost_advantage
+            and not self.normalize_advantage_per_mini_batch,
         )
 
     def update(self):  # noqa: C901
@@ -243,7 +266,9 @@ class FPPOWithExtractor:
         mean_estimator_loss = 0.0
 
         generator = (
-            self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
             if self.policy.is_recurrent
             else self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         )
@@ -275,11 +300,13 @@ class FPPOWithExtractor:
             # Normalize advantages per mini-batch if requested.
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1e-8
+                    )
                     if self.normalize_cost_advantage:
-                        cost_advantages_batch = (cost_advantages_batch - cost_advantages_batch.mean()) / (
-                            cost_advantages_batch.std() + 1e-8
-                        )
+                        cost_advantages_batch = (
+                            cost_advantages_batch - cost_advantages_batch.mean()
+                        ) / (cost_advantages_batch.std() + 1e-8)
 
             # Actor forward pass
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -294,7 +321,9 @@ class FPPOWithExtractor:
                 hist_latent_batch = self.policy.actor.infer_hist_latent(obs_batch)
             priv_reg_loss = (priv_latent_batch - hist_latent_batch.detach()).norm(p=2, dim=1).mean()
             priv_reg_stage = min(
-                max((self.counter - self.priv_reg_coef_schedual[2]), 0) / self.priv_reg_coef_schedual[3], 1
+                max((self.counter - self.priv_reg_coef_schedual[2]), 0)
+                / self.priv_reg_coef_schedual[3],
+                1,
             )
             priv_reg_coef = (
                 priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0])
@@ -321,8 +350,11 @@ class FPPOWithExtractor:
                 surrogate_loss = torch.max(surrogate, surrogate_clipped)
             surrogate_loss = surrogate_loss.mean()
             cost_surrogate = (torch.squeeze(cost_advantages_batch) * ratio).mean()
-            policy_loss = surrogate_loss - self.entropy_coef * entropy_batch.mean() + priv_reg_coef * priv_reg_loss
-
+            policy_loss = (
+                surrogate_loss
+                - self.entropy_coef * entropy_batch.mean()
+                + priv_reg_coef * priv_reg_loss
+            )
 
             # Compute reward and cost gradients for projection.
             g = torch.autograd.grad(policy_loss, self._actor_params, retain_graph=True)
@@ -357,20 +389,36 @@ class FPPOWithExtractor:
             if self.delta_safe is None or self.max_backtracks <= 0:
                 v = self._project_direction(g, g_c, dot_gc_g, gc_norm_sq, c_hat, alpha, inv_precond)
                 self._apply_update(self._actor_params, base_params, v, alpha)
-                kl_mean = self._compute_kl(obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0])
+                kl_mean = self._compute_kl(
+                    obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
+                )
             else:
+                accepted = False
                 for _ in range(self.max_backtracks + 1):
-                    v = self._project_direction(g, g_c, dot_gc_g, gc_norm_sq, c_hat, alpha, inv_precond)
+                    v = self._project_direction(
+                        g, g_c, dot_gc_g, gc_norm_sq, c_hat, alpha, inv_precond
+                    )
                     self._apply_update(self._actor_params, base_params, v, alpha)
                     kl_mean = self._compute_kl(
                         obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
                     )
                     if kl_mean <= self.delta_safe:
+                        accepted = True
                         break
                     alpha *= self.backtrack_coeff
+                if not accepted:
+                    # Backtracking failed to satisfy KL safety bound; revert actor update.
+                    for param, base in zip(self._actor_params, base_params):
+                        param.data.copy_(base)
+                    alpha = 0.0
+                    kl_mean = self._compute_kl(
+                        obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
+                    )
 
             # Critic updates
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(
+                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+            )
             cost_value_batch = self.policy.evaluate_cost(
                 critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[2]
             )
@@ -386,22 +434,25 @@ class FPPOWithExtractor:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             if self.use_clipped_value_loss:
-                cost_value_clipped = cost_values_batch + (cost_value_batch - cost_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
+                cost_value_clipped = cost_values_batch + (
+                    cost_value_batch - cost_values_batch
+                ).clamp(-self.clip_param, self.clip_param)
                 cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
                 cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
             else:
                 cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
 
-            critic_loss = self.value_loss_coef * value_loss + self.cost_value_loss_coef * cost_value_loss
+            critic_loss = (
+                self.value_loss_coef * value_loss + self.cost_value_loss_coef * cost_value_loss
+            )
             self.optimizer.zero_grad()
             critic_loss.backward()
             if self.is_multi_gpu:
                 self.reduce_parameters()
             nn.utils.clip_grad_norm_(
-                list(self.policy.critic.parameters()) + list(self.policy.cost_critic.parameters()), self.max_grad_norm
+                list(self.policy.critic.parameters()) + list(self.policy.cost_critic.parameters()),
+                self.max_grad_norm,
             )
             self.optimizer.step()
 
@@ -467,7 +518,9 @@ class FPPOWithExtractor:
             return 0.0
         mean_hist_latent_loss = 0.0
         generator = (
-            self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
             if self.policy.is_recurrent
             else self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         )
@@ -476,15 +529,21 @@ class FPPOWithExtractor:
             if obs_batch is None:
                 continue
             with torch.inference_mode():
-                self.policy.act(obs_batch, hist_encoding=True, masks=batch[13], hidden_states=batch[12][0])
+                self.policy.act(
+                    obs_batch, hist_encoding=True, masks=batch[13], hidden_states=batch[12][0]
+                )
             with torch.inference_mode():
                 priv_latent_batch = self.policy.actor.infer_priv_latent(obs_batch)
             hist_latent_batch = self.policy.actor.infer_hist_latent(obs_batch)
-            hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
+            hist_latent_loss = (
+                (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
+            )
             if self.hist_encoder_optimizer is not None:
                 self.hist_encoder_optimizer.zero_grad()
                 hist_latent_loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.actor.history_encoder.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    self.policy.actor.history_encoder.parameters(), self.max_grad_norm
+                )
                 self.hist_encoder_optimizer.step()
             mean_hist_latent_loss += hist_latent_loss.item()
 
@@ -541,7 +600,9 @@ class FPPOWithExtractor:
         if inv_precond is None:
             gc_norm_value = gc_norm_sq.item()
         else:
-            gc_norm_value = sum((gci * inv_i * gci).sum() for gci, inv_i in zip(g_c, inv_precond)).item()
+            gc_norm_value = sum(
+                (gci * inv_i * gci).sum() for gci, inv_i in zip(g_c, inv_precond)
+            ).item()
         if gc_norm_value < self.projection_eps:
             return g
         b_value = (-c_hat / alpha).item()
@@ -565,7 +626,9 @@ class FPPOWithExtractor:
             return
         with torch.no_grad():
             for v, g in zip(self._precond_v, grads):
-                v.mul_(self.preconditioner_beta).addcmul_(g, g, value=1.0 - self.preconditioner_beta)
+                v.mul_(self.preconditioner_beta).addcmul_(
+                    g, g, value=1.0 - self.preconditioner_beta
+                )
 
     def _get_inv_preconditioner(self):
         if not self.use_preconditioner or self._precond_v is None:
@@ -593,9 +656,10 @@ class FPPOWithExtractor:
             sigma_batch = self.policy.action_std
             kl = torch.sum(
                 torch.log(sigma_batch / old_sigma + 1.0e-5)
-                + (torch.square(old_sigma) + torch.square(old_mu - mu_batch)) / (2.0 * torch.square(sigma_batch))
+                + (torch.square(old_sigma) + torch.square(old_mu - mu_batch))
+                / (2.0 * torch.square(sigma_batch))
                 - 0.5,
-                axis=-1,
+                dim=-1,
             )
             kl_mean = torch.mean(kl)
             if self.is_multi_gpu:

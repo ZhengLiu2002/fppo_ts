@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING
 
 from isaaclab.envs.ui.base_env_window import BaseEnvWindow
 import omni.kit.app
+
 if TYPE_CHECKING:
     from crl_isaaclab.envs.crl_manager_based_env import CRLManagerBasedEnv
+
 
 class CRLManagerBasedRLEnvWindow(BaseEnvWindow):
     """Window manager for the RL environment.

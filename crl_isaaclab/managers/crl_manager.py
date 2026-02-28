@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import inspect
@@ -19,9 +18,10 @@ CRL Manager is dealing with goal heading position
 It is similar to a CommandMangner which is a handling Position Command
 """
 
+
 class CRLTerm(CommandTerm):
     def __init__(self, cfg: CRLTermCfg, env: CRLManagerBasedRLEnv):
-        super().__init__(cfg, env) 
+        super().__init__(cfg, env)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         if env_ids is None:
@@ -39,7 +39,7 @@ class CRLTerm(CommandTerm):
         self._resample(env_ids)
 
         return extras
-    
+
     def _resample(self, env_ids: Sequence[int]):
         if len(env_ids) != 0:
             self._resample_command(env_ids)
@@ -59,16 +59,16 @@ class CRLTerm(CommandTerm):
         # check if function raises NotImplementedError
         source_code = inspect.getsource(self._set_debug_vis_impl)
         return "NotImplementedError" not in source_code
-    
+
     def __call__(self):
-        pass 
+        pass
 
 
-    
 class CRLManager(CommandManager):
     _env: CRLManagerBasedRLEnv
-    def __init__(self, cfg: object, env: CRLManagerBasedRLEnv):        
-        super().__init__(cfg, env) 
+
+    def __init__(self, cfg: object, env: CRLManagerBasedRLEnv):
+        super().__init__(cfg, env)
 
     def __call__(self):
         for term in self._terms.values():
@@ -104,6 +104,8 @@ class CRLManager(CommandManager):
             term = term_cfg.class_type(term_cfg, self._env)
             # sanity check if term is valid type
             if not isinstance(term, CRLTerm):
-                raise TypeError(f"Returned object for the term '{term_name}' is not of type CRLType.")
+                raise TypeError(
+                    f"Returned object for the term '{term_name}' is not of type CRLType."
+                )
             # add class to dict
             self._terms[term_name] = term

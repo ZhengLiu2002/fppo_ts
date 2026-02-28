@@ -9,6 +9,8 @@
 
 import argparse
 import sys
+import os
+import warnings
 from pathlib import Path
 
 # Ensure repository root is on sys.path for `scripts.*` imports.
@@ -21,15 +23,28 @@ if _TASKS_ROOT.is_dir() and str(_TASKS_ROOT) not in sys.path:
 
 from isaaclab.app import AppLauncher
 
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Overriding environment Isaac-Parkour-Galileo-v0 already in registry.*",
+    category=UserWarning,
+)
+
 # local imports
 import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=500, help="Length of the recorded video (in steps).")
 parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+    "--video", action="store_true", default=False, help="Record videos during training."
+)
+parser.add_argument(
+    "--video_length", type=int, default=500, help="Length of the recorded video (in steps)."
+)
+parser.add_argument(
+    "--disable_fabric",
+    action="store_true",
+    default=False,
+    help="Disable fabric and use USD I/O operations.",
 )
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
@@ -38,7 +53,15 @@ parser.add_argument(
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
 )
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--real-time", action="store_true", default=False, help="Run in real-time, if possible."
+)
+parser.add_argument(
+    "--force_gui",
+    action="store_true",
+    default=False,
+    help="Force GUI mode and skip auto headless fallback.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -48,6 +71,54 @@ args_cli = parser.parse_args()
 if args_cli.video:
     args_cli.enable_cameras = True
 
+
+def _display_available() -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _livestream_enabled() -> bool:
+    livestream_arg = getattr(args_cli, "livestream", -1)
+    if livestream_arg is not None and livestream_arg >= 0:
+        return livestream_arg > 0
+    return int(os.environ.get("LIVESTREAM", 0)) > 0
+
+
+if args_cli.force_gui:
+    # Explicitly force GUI mode, even if env vars are missing/misdetected.
+    args_cli.headless = False
+    os.environ["HEADLESS"] = "0"
+else:
+    # Guard against launching GUI experiences on machines without a display server.
+    # In this case, some UI extensions (e.g. omni.physx.ui) can crash at startup
+    # while trying to bind keyboard/window hooks.
+    if not _display_available() and not _livestream_enabled():
+        if not args_cli.headless:
+            print(
+                "[WARN] No DISPLAY/WAYLAND display server detected. "
+                "Forcing headless mode for stable play startup."
+            )
+            args_cli.headless = True
+        disable_exts = [
+            "omni.physx.ui",
+            "omni.kit.window.drop_support",
+            "omni.kit.menu.utils",
+        ]
+        existing_kit_args = getattr(args_cli, "kit_args", "") or ""
+        for ext_name in disable_exts:
+            token = f"--disable {ext_name}"
+            if token not in existing_kit_args:
+                existing_kit_args = f"{existing_kit_args} {token}".strip()
+        args_cli.kit_args = existing_kit_args
+
+print(
+    "[INFO] Play launch selection: "
+    f"force_gui={args_cli.force_gui}, "
+    f"headless={args_cli.headless}, "
+    f"DISPLAY={os.environ.get('DISPLAY', '')}, "
+    f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', '')}, "
+    f"LIVESTREAM={os.environ.get('LIVESTREAM', '')}"
+)
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -55,7 +126,6 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import os
 import time
 import torch
 import numpy as np
@@ -66,17 +136,13 @@ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from crl_tasks.crl_task.config.galileo.agents.crl_rl_cfg import CRLRslRlOnPolicyRunnerCfg
+from crl_tasks.tasks.galileo.config.agents.rsl_rl_cfg import CRLRslRlOnPolicyRunnerCfg
 
-from scripts.rsl_rl.exporter import (
-export_teacher_policy_as_jit,
-export_teacher_policy_as_onnx,
-)
+from scripts.rsl_rl.exporter import export_inference_cfg, export_policy_as_onnx_dual_input
 from scripts.rsl_rl.vecenv_wrapper import CRLRslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
-
 
 
 def _print_terrain_summary(base_env):
@@ -88,15 +154,21 @@ def _print_terrain_summary(base_env):
         uniq_lvl, lvl_counts = np.unique(levels, return_counts=True)
         uniq_typ, typ_counts = np.unique(types, return_counts=True)
         gen_cfg = terrain.cfg.terrain_generator
-        print("[INFO] Terrain generator layout:"
-              f" rows={getattr(gen_cfg, 'num_rows', '?')},"
-              f" cols={getattr(gen_cfg, 'num_cols', '?')},"
-              f" curriculum={getattr(gen_cfg, 'curriculum', '?')},"
-              f" difficulty_range={getattr(gen_cfg, 'difficulty_range', '?')}")
-        print("[INFO] Terrain level histogram (level:count):",
-              {int(k): int(v) for k, v in zip(uniq_lvl, lvl_counts)})
-        print("[INFO] Terrain type histogram (col_idx:count):",
-              {int(k): int(v) for k, v in zip(uniq_typ, typ_counts)})
+        print(
+            "[INFO] Terrain generator layout:"
+            f" rows={getattr(gen_cfg, 'num_rows', '?')},"
+            f" cols={getattr(gen_cfg, 'num_cols', '?')},"
+            f" curriculum={getattr(gen_cfg, 'curriculum', '?')},"
+            f" difficulty_range={getattr(gen_cfg, 'difficulty_range', '?')}"
+        )
+        print(
+            "[INFO] Terrain level histogram (level:count):",
+            {int(k): int(v) for k, v in zip(uniq_lvl, lvl_counts)},
+        )
+        print(
+            "[INFO] Terrain type histogram (col_idx:count):",
+            {int(k): int(v) for k, v in zip(uniq_typ, typ_counts)},
+        )
     except Exception as exc:  # pragma: no cover - debug aid
         print(f"[WARN] Unable to print terrain summary: {exc}")
 
@@ -105,7 +177,10 @@ def main():
     """Play with RSL-RL agent."""
     # parse configuration
     env_cfg = parse_env_cfg(
-        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
+        args_cli.task,
+        device=args_cli.device,
+        num_envs=args_cli.num_envs,
+        use_fabric=not args_cli.disable_fabric,
     )
     agent_cfg: CRLRslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
@@ -116,12 +191,16 @@ def main():
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", args_cli.task)
         if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
+            print(
+                "[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task."
+            )
             return
     elif args_cli.checkpoint:
         resume_path = retrieve_file_path(args_cli.checkpoint)
     else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = get_checkpoint_path(
+            log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint
+        )
 
     log_dir = os.path.dirname(resume_path)
 
@@ -131,11 +210,15 @@ def main():
     try:
         base_env = env.unwrapped
         if hasattr(base_env, "max_episode_length"):
-            new_len = int(base_env.max_episode_length * 100)  # effectively disable time-out for play
+            new_len = int(
+                base_env.max_episode_length * 100
+            )  # effectively disable time-out for play
             base_env.max_episode_length = new_len
             if hasattr(base_env, "cfg") and hasattr(base_env.cfg, "episode_length_s"):
                 base_env.cfg.episode_length_s = base_env.cfg.episode_length_s * 100.0
-            print(f"[INFO] Play mode: time-out relaxed to {new_len} steps (goal/fall still terminate).")
+            print(
+                f"[INFO] Play mode: time-out relaxed to {new_len} steps (goal/fall still terminate)."
+            )
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[WARN] Failed to relax play time-out: {exc}")
 
@@ -160,7 +243,9 @@ def main():
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    ppo_runner = OnPolicyRunnerWithExtractor(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    ppo_runner = OnPolicyRunnerWithExtractor(
+        env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
+    )
     ppo_runner.load(resume_path)
     print(ppo_runner)
     # obtain the trained policy for inference
@@ -168,9 +253,21 @@ def main():
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
     policy_nn = ppo_runner.alg.policy
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported_policy")
-    export_teacher_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
-    export_teacher_policy_as_onnx(
-        policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
+    export_cfg = export_inference_cfg(
+        env,
+        env_cfg,
+        export_model_dir,
+        load_run=agent_cfg.load_run or ".*",
+        checkpoint=resume_path,
+        agent_cfg=agent_cfg,
+    )
+    export_policy_as_onnx_dual_input(
+        policy_nn,
+        normalizer=ppo_runner.obs_normalizer,
+        path=export_model_dir,
+        filename="policy.onnx",
+        actor_obs_dim=export_cfg["input_obs_size_map"]["actor_obs"],
+        vae_obs_dim=export_cfg["input_obs_size_map"]["vae_obs"],
     )
 
     dt = env.unwrapped.step_dt

@@ -16,14 +16,16 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math  import euler_xyz_from_quat, wrap_to_pi
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 from isaaclab.sensors import ContactSensor
+
 if TYPE_CHECKING:
     from crl_isaaclab.envs import CRLManagerBasedRLEnv
 
+
 def time_out(
     env: CRLManagerBasedRLEnv,
-):  
+):
     return env.episode_length_buf >= env.max_episode_length
 
 
@@ -58,7 +60,9 @@ def body_contact(
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history
     return torch.any(
-        torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > threshold, dim=1
+        torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0]
+        > threshold,
+        dim=1,
     )
 
 
@@ -82,4 +86,6 @@ def terrain_out_of_bounds(
         y_out = torch.abs(asset.data.root_pos_w[:, 1]) > 0.5 * map_height - distance_buffer
         return torch.logical_or(x_out, y_out)
     else:
-        raise ValueError("Received unsupported terrain type, must be either 'plane' or 'generator'.")
+        raise ValueError(
+            "Received unsupported terrain type, must be either 'plane' or 'generator'."
+        )
