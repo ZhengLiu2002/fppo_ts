@@ -120,6 +120,25 @@ class NP3O(PPO):
                             cost_advantages_batch - cost_advantages_batch.mean()
                         ) / (cost_advantages_batch.std() + 1e-8)
 
+            advantages_batch = self._sanitize_tensor(
+                advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            )
+            cost_advantages_batch = self._sanitize_tensor(
+                cost_advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            )
+            returns_batch = self._sanitize_tensor(
+                returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            cost_returns_batch = self._sanitize_tensor(
+                cost_returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            target_values_batch = self._sanitize_tensor(
+                target_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            cost_values_batch = self._sanitize_tensor(
+                cost_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(
@@ -133,13 +152,7 @@ class NP3O(PPO):
             entropy_batch = self.policy.entropy
 
             with torch.inference_mode():
-                kl = torch.sum(
-                    torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                    + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                    / (2.0 * torch.square(sigma_batch))
-                    - 0.5,
-                    dim=-1,
-                )
+                kl = self._safe_kl(mu_batch, sigma_batch, old_mu_batch, old_sigma_batch)
                 kl_mean = self._all_reduce_mean(torch.mean(kl))
 
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -155,7 +168,7 @@ class NP3O(PPO):
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.learning_rate
 
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            ratio = self._safe_ratio(actions_log_prob_batch, old_actions_log_prob_batch)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -165,6 +178,10 @@ class NP3O(PPO):
             cost_surrogate = (torch.squeeze(cost_advantages_batch) * ratio).mean()
             batch_cost_return, batch_cost_violation, c_hat = self._batch_cost_stats(cost_returns_batch)
             viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat)
+            surrogate_loss = self._sanitize_tensor(
+                surrogate_loss, nan=0.0, posinf=1.0e6, neginf=-1.0e6, clamp=1.0e6
+            )
+            viol_loss = self._sanitize_tensor(viol_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6)
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -175,6 +192,7 @@ class NP3O(PPO):
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
+            value_loss = self._sanitize_tensor(value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6)
 
             if self.use_clipped_value_loss:
                 cost_value_clipped = cost_values_batch + (
@@ -185,6 +203,9 @@ class NP3O(PPO):
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
             else:
                 cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
+            cost_value_loss = self._sanitize_tensor(
+                cost_value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             loss = (
                 surrogate_loss
@@ -193,6 +214,9 @@ class NP3O(PPO):
                 + self.cost_value_loss_coef * cost_value_loss
                 - self.entropy_coef * entropy_batch.mean()
             )
+            loss = self._sanitize_tensor(loss, nan=0.0, posinf=1.0e6, neginf=-1.0e6, clamp=1.0e6)
+            if not torch.isfinite(loss):
+                continue
 
             self.optimizer.zero_grad()
             loss.backward()

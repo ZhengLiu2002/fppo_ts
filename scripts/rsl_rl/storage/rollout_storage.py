@@ -25,10 +25,6 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
-            self.actor_observations = None
-            self.vae_obs_history = None
-            self.next_actor_observations = None
-            self.amp_observations = None
 
         def clear(self):
             self.__init__()
@@ -42,10 +38,6 @@ class RolloutStorage:
         privileged_obs_shape,
         actions_shape,
         device="cpu",
-        actor_obs_shape=None,
-        vae_obs_history_shape=None,
-        next_actor_obs_shape=None,
-        amp_obs_shape=None,
     ):
         # store inputs
         self.training_type = training_type
@@ -55,10 +47,6 @@ class RolloutStorage:
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
         self.actions_shape = actions_shape
-        self.actor_obs_shape = actor_obs_shape
-        self.vae_obs_history_shape = vae_obs_history_shape
-        self.next_actor_obs_shape = next_actor_obs_shape
-        self.amp_obs_shape = amp_obs_shape
 
         # Core
         self.observations = torch.zeros(
@@ -76,30 +64,6 @@ class RolloutStorage:
             num_transitions_per_env, num_envs, *actions_shape, device=self.device
         )
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
-        if actor_obs_shape is not None:
-            self.actor_observations = torch.zeros(
-                num_transitions_per_env, num_envs, *actor_obs_shape, device=self.device
-            )
-        else:
-            self.actor_observations = None
-        if vae_obs_history_shape is not None:
-            self.vae_obs_history = torch.zeros(
-                num_transitions_per_env, num_envs, *vae_obs_history_shape, device=self.device
-            )
-        else:
-            self.vae_obs_history = None
-        if next_actor_obs_shape is not None:
-            self.next_actor_observations = torch.zeros(
-                num_transitions_per_env, num_envs, *next_actor_obs_shape, device=self.device
-            )
-        else:
-            self.next_actor_observations = None
-        if amp_obs_shape is not None:
-            self.amp_observations = torch.zeros(
-                num_transitions_per_env, num_envs, *amp_obs_shape, device=self.device
-            )
-        else:
-            self.amp_observations = None
 
         # for distillation
         if training_type == "distillation":
@@ -153,27 +117,6 @@ class RolloutStorage:
         if transition.cost_rewards is not None:
             self.cost_rewards[self.step].copy_(transition.cost_rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
-        if (
-            self.actor_observations is not None
-            and getattr(transition, "actor_observations", None) is not None
-        ):
-            self.actor_observations[self.step].copy_(transition.actor_observations)
-        if (
-            self.vae_obs_history is not None
-            and getattr(transition, "vae_obs_history", None) is not None
-        ):
-            self.vae_obs_history[self.step].copy_(transition.vae_obs_history)
-        if (
-            self.next_actor_observations is not None
-            and getattr(transition, "next_actor_observations", None) is not None
-        ):
-            self.next_actor_observations[self.step].copy_(transition.next_actor_observations)
-        if (
-            self.amp_observations is not None
-            and getattr(transition, "amp_observations", None) is not None
-        ):
-            self.amp_observations[self.step].copy_(transition.amp_observations)
-
         # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
@@ -340,22 +283,6 @@ class RolloutStorage:
         cost_values = self.cost_values.flatten(0, 1)
         cost_returns = self.cost_returns.flatten(0, 1)
         cost_advantages = self.cost_advantages.flatten(0, 1)
-        if self.actor_observations is not None:
-            actor_observations = self.actor_observations.flatten(0, 1)
-        else:
-            actor_observations = None
-        if self.vae_obs_history is not None:
-            vae_obs_history = self.vae_obs_history.flatten(0, 1)
-        else:
-            vae_obs_history = None
-        if self.next_actor_observations is not None:
-            next_actor_observations = self.next_actor_observations.flatten(0, 1)
-        else:
-            next_actor_observations = None
-        if self.amp_observations is not None:
-            amp_observations = self.amp_observations.flatten(0, 1)
-        else:
-            amp_observations = None
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -375,22 +302,6 @@ class RolloutStorage:
                 obs_batch = observations[batch_idx]
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
-                if actor_observations is not None:
-                    actor_obs_batch = actor_observations[batch_idx]
-                else:
-                    actor_obs_batch = None
-                if vae_obs_history is not None:
-                    vae_obs_history_batch = vae_obs_history[batch_idx]
-                else:
-                    vae_obs_history_batch = None
-                if next_actor_observations is not None:
-                    next_actor_obs_batch = next_actor_observations[batch_idx]
-                else:
-                    next_actor_obs_batch = None
-                if amp_observations is not None:
-                    amp_obs_batch = amp_observations[batch_idx]
-                else:
-                    amp_obs_batch = None
 
                 # -- For PPO
                 target_values_batch = values[batch_idx]
@@ -419,10 +330,6 @@ class RolloutStorage:
                     old_sigma_batch,
                     (None, None, None),
                     None,
-                    actor_obs_batch,
-                    vae_obs_history_batch,
-                    next_actor_obs_batch,
-                    amp_obs_batch,
                 )
 
     # for reinfrocement learning with recurrent networks
@@ -505,8 +412,4 @@ class RolloutStorage:
                     old_sigma_batch,
                     (hid_a, hid_c, hid_cost),
                     traj_masks[:, batch_idx],
-                    None,
-                    None,
-                    None,
-                    None,
                 )

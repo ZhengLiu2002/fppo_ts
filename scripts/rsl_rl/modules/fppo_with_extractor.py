@@ -219,7 +219,6 @@ class FPPOWithExtractor:
             costs = torch.zeros_like(rewards)
         self.transition.cost_rewards = costs.clone()
         self.transition.dones = dones
-        self.transition.next_actor_observations = obs
 
         if "time_outs" in infos:
             time_outs = infos["time_outs"].unsqueeze(1).to(self.device)
@@ -291,10 +290,6 @@ class FPPOWithExtractor:
                 old_sigma_batch,
                 hid_states_batch,
                 masks_batch,
-                _actor_obs_batch,
-                _vae_obs_history_batch,
-                _next_actor_obs_batch,
-                _amp_obs_batch,
             ) = batch
 
             # Normalize advantages per mini-batch if requested.

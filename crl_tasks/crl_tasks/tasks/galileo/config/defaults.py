@@ -208,9 +208,12 @@ class GalileoDefaults:
         render_interval = 4
 
     class curriculum:
-        # Curriculum is gated by env.common_step_counter (per-env steps). With large num_envs,
-        # 700 episodes/level advances very slowly; reduce for visible progression.
-        episodes_per_level = 20
+        # Performance-based adaptive curriculum. episodes_per_level is kept for
+        # backward compatibility but the actual upgrade/downgrade decisions are
+        # driven by survival rate + tracking error score (see curriculums.py).
+        episodes_per_level = 10
+        terrain_move_up_ratio = 0.3
+        terrain_move_down_ratio = 0.25
 
     class sim:
         dt = 0.0025
@@ -311,10 +314,12 @@ class GalileoDefaults:
         difficulty_range = (0.0, 1.0)
 
     class command:
-        lin_x_level: float = 0.08
+        lin_x_level: float = 0.3
         max_lin_x_level: float = 1.0
-        ang_z_level: float = 0.04
+        ang_z_level: float = 0.3
         max_ang_z_level: float = 1.0
+        lin_x_level_step: float = 0.02
+        ang_z_level_step: float = 0.02
         min_abs_lin_vel_x: float = 0.1
         min_abs_lin_vel_y: float = 0.0
         heading_control_stiffness = 0.8
@@ -322,16 +327,16 @@ class GalileoDefaults:
         # 默认配置（用于 CommandsCfg 的初始化，不在地形特定配置中）
         class default:
             heading_command_prob: float = 0.2
-            standing_command_prob: float = 0.0
+            standing_command_prob: float = 0.05
             yaw_command_prob: float = 0.0
-            lin_vel_x = (0.1, 0.4)
+            lin_vel_x = (0.25, 0.5)
             lin_vel_y = (-0.1, 0.1)
-            ang_vel_z = (-0.08, 0.08)
+            ang_vel_z = (-0.15, 0.15)
             heading = (-math.pi / 8, math.pi / 8)
-            start_curriculum_lin_x = (0.1, 0.25)
-            start_curriculum_ang_z = (-0.05, 0.05)
-            max_curriculum_lin_x = (0.35, 0.55)
-            max_curriculum_ang_z = (-0.12, 0.12)
+            start_curriculum_lin_x = (0.25, 0.45)
+            start_curriculum_ang_z = (-0.1, 0.1)
+            max_curriculum_lin_x = (0.4, 0.8)
+            max_curriculum_ang_z = (-0.3, 0.3)
 
         ranges = {
             "pyramid_stairs": dict(
@@ -428,7 +433,7 @@ class GalileoDefaults:
         }
 
         resampling_time_range = (6.0, 6.0)
-        clips = dict(lin_vel_clip=0.2, ang_vel_clip=0.3)
+        clips = dict(lin_vel_clip=0.1, ang_vel_clip=0.1)
 
     class priv_obs_norm:
         """Normalization ranges for privileged observations."""
@@ -548,7 +553,7 @@ class GalileoDefaults:
             desired_kl=0.004,
             num_learning_epochs=5,
             num_mini_batches=4,
-            learning_rate=2.0e-5,
+            learning_rate=1.0e-3,
             schedule="adaptive",
             gamma=0.99,
             lam=0.95,
@@ -564,58 +569,89 @@ class GalileoDefaults:
 
         # 各算法差异化字段（只写需要的即可）
         per_algo = {
-            # FPPO
+            # FPPO（更激进参数：更大步长、更松约束、更少回溯）
             "fppo": dict(
                 cost_value_loss_coef=1.0,
-                step_size=1.5e-4,
+                desired_kl=0.01,
+                step_size=6.0e-4,
                 cost_gamma=None,
                 cost_lam=None,
-                delta_safe=0.01,
+                delta_safe=0.03,
                 backtrack_coeff=0.5,
                 max_backtracks=10,
-                projection_eps=1e-8,
+                projection_eps=1e-6,
                 normalize_cost_advantage=False,
                 constraint_normalization=True,
-                constraint_norm_beta=0.99,
+                constraint_norm_beta=0.9,
                 constraint_norm_min_scale=1e-3,
                 constraint_norm_max_scale=10.0,
                 constraint_norm_clip=5.0,
-                constraint_proxy_delta=0.1,
+                constraint_proxy_delta=0.2,
                 constraint_agg_tau=0.5,
                 constraint_scale_by_gamma=True,
                 use_preconditioner=True,
                 preconditioner_beta=0.999,
                 preconditioner_eps=1e-8,
                 feasible_first=True,
-                feasible_first_coef=1.0,
+                feasible_first_coef=0.5,
+                feasible_cost_margin=5e-4,
+                infeasible_improve_ratio=0.005,
+                infeasible_improve_abs=5e-4,
+                min_step_size=1e-7,
+                relax_cost_margin=0.2,
+                step_size_adaptive=True,
+                step_size_up=1.03,
+                step_size_down=0.7,
+                step_size_min=5.0e-5,
+                step_size_max=2.0e-3,
+                target_accept_rate=0.7,
+                step_size_cost_margin=0.2,
+                cost_viol_loss_coef=0.05,
+                k_value=0.1,
+                k_growth=1.00005,
+                k_max=0.5,
+                k_decay=0.9998,
+                k_min=0.02,
+                k_violation_threshold=0.02,
                 dagger_update_freq=20,
                 priv_reg_coef_schedual=[0.0, 0.1, 2000.0, 3000.0],
             ),
             # NP3O
             "np3o": dict(
                 cost_value_loss_coef=1.0,
+                learning_rate=5.0e-4,
+                schedule="fixed",
+                desired_kl=0.01,
                 cost_gamma=None,
                 cost_lam=None,
-                normalize_cost_advantage=False,
-                cost_viol_loss_coef=1.0,
+                normalize_cost_advantage=True,
+                cost_viol_loss_coef=0.2,
                 k_value=0.05,
-                k_growth=1.0004,
-                k_max=1.0,
+                k_growth=1.0001,
+                k_max=0.5,
                 dagger_update_freq=20,
             ),
             # PPO（示例：如果你切到 PPO，只需要写 PPO 特有/你要覆写的字段）
             "ppo": dict(),
+            # PPO-Lagrange：拉格朗日乘子惩罚约束
+            "ppo_lagrange": dict(
+                cost_value_loss_coef=1.0,
+                cost_gamma=None,
+                cost_lam=None,
+                normalize_cost_advantage=False,
+                lagrange_lr=1.0e-2,
+                lagrange_max=100.0,
+            ),
             # 其他算法暂时留空：后续按需在这里补字段即可
-            "ppo_lagrange": dict(),
             "cpo": dict(),
             "pcpo": dict(),
             "focpo": dict(),
             "distillation": dict(),
         }
 
-        # Teacher/Student 差异（可选）
+        # Teacher/Student 差异
         teacher_override = dict(
-            entropy_coef=0.005,
+            entropy_coef=0.006,
         )
         student_override = dict(
             entropy_coef=0.01,

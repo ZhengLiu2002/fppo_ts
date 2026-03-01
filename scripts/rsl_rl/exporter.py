@@ -38,15 +38,24 @@ def _looks_like_pattern(name: str) -> bool:
 
 
 def _infer_actor_input_dim(actor: torch.nn.Module) -> int | None:
+    """Infer actor input dim by taking the maximum in_features across Linear layers.
+
+    Some actors contain auxiliary encoders whose first Linear has smaller in_features
+    (e.g., scan encoder), so returning the first Linear underestimates the true
+    observation size. Using the max is safer for ONNX export.
+    """
+    max_in = None
     if hasattr(actor, "in_features"):
         try:
-            return int(getattr(actor, "in_features"))
+            max_in = int(getattr(actor, "in_features"))
         except Exception:
-            pass
+            max_in = None
     for module in actor.modules():
         if isinstance(module, torch.nn.Linear):
-            return int(module.in_features)
-    return None
+            val = int(module.in_features)
+            if (max_in is None) or (val > max_in):
+                max_in = val
+    return max_in
 
 
 def _call_actor(actor: torch.nn.Module, obs: torch.Tensor) -> torch.Tensor:
@@ -99,14 +108,6 @@ EXPORT_PROFILE_GALILEO = {
         "actions_gt",
         "base_commands_gt",
     ],
-    "input_vae_obs_names": [
-        "base_ang_vel_nad",
-        "projected_gravity_nad",
-        "joint_pos_rel_nad",
-        "joint_vel_rel_nad",
-        "actions_gt",
-        "base_commands_gt",
-    ],
     "input_actor_obs_scales": {
         "base_ang_vel_nad": 0.25,
         "projected_gravity_nad": 1.0,
@@ -115,19 +116,11 @@ EXPORT_PROFILE_GALILEO = {
         "actions_gt": 0.25,
         "base_commands_gt": [2.0, 2.0, 0.25],
     },
-    "input_vae_obs_scales": {
-        "base_ang_vel_nad": 0.25,
-        "projected_gravity_nad": 1.0,
-        "joint_pos_rel_nad": 1.0,
-        "joint_vel_rel_nad": 0.05,
-        "actions_gt": 0.25,
-        "base_commands_gt": [2.0, 2.0, 0.25],
-    },
-    "input_obs_size_map": {"actor_obs": 45, "vae_obs": 45},
+    "input_obs_size_map": {"actor_obs": 45},
     "action_scale": 0.25,
     "clip_actions": 100.0,
     "clip_obs": 100.0,
-    "obs_history_length": {"actor_obs": 1, "vae_obs": 5},
+    "obs_history_length": {"actor_obs": 1},
     "joint_kp": [70.0] * 12,
     "joint_kd": [3.5] * 12,
     "max_torques": [80.0] * 12,
@@ -321,54 +314,17 @@ def export_policy_as_onnx_dual_input(
     normalizer: object | None = None,
     filename="policy.onnx",
     actor_obs_dim: int | None = None,
-    vae_obs_dim: int | None = None,
     verbose: bool = False,
 ):
-    """Export policy into an ONNX file with (actor_obs, vae_obs) inputs.
-
-    The exported model accepts two inputs but only uses actor_obs for inference.
-    If actor_obs dimension is smaller than the model's expected input size,
-    the remaining dimensions are zero-padded to match.
-    """
+    """Export policy into an ONNX file with a single actor_obs input."""
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
     policy_exporter = _OnnxPolicyExporterDualInput(
         actor_critic,
         normalizer,
         actor_obs_dim=actor_obs_dim,
-        vae_obs_dim=vae_obs_dim,
         verbose=verbose,
     )
-    policy_exporter.export(path, filename)
-
-
-def export_amp_vae_policy_as_onnx(
-    actor: object,
-    vae: object,
-    path: str,
-    filename="policy.onnx",
-    verbose=False,
-):
-
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-    policy_exporter = OnnxAmpVaeExporter(actor, vae, verbose)
-    policy_exporter.export(path, filename)
-
-
-def export_amp_vae_perception_policy_as_onnx(
-    actor: object,
-    vae: object,
-    path: str,
-    filename="policy.onnx",
-    verbose=False,
-):
-
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-    policy_exporter = OnnxAmpVaeExporter(actor, vae, verbose)
     policy_exporter.export(path, filename)
 
 
@@ -488,14 +444,13 @@ class _OnnxPolicyExporter(torch.nn.Module):
 
 
 class _OnnxPolicyExporterDualInput(torch.nn.Module):
-    """Exporter that exposes two inputs: actor_obs and vae_obs."""
+    """Exporter that exposes a single actor_obs input."""
 
     def __init__(
         self,
         actor_critic: object,
         normalizer: object | None,
         actor_obs_dim: int | None,
-        vae_obs_dim: int | None,
         verbose: bool = False,
     ):
         super().__init__()
@@ -507,28 +462,53 @@ class _OnnxPolicyExporterDualInput(torch.nn.Module):
             self.normalizer = copy.deepcopy(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
-        self.actor_obs_dim = int(actor_obs_dim) if actor_obs_dim is not None else None
-        self.vae_obs_dim = int(vae_obs_dim) if vae_obs_dim is not None else None
-        self.expected_obs_dim = _infer_actor_input_dim(self.actor)
-        if self.expected_obs_dim is None and self.actor_obs_dim is not None:
-            self.expected_obs_dim = self.actor_obs_dim
+        inferred = _infer_actor_input_dim(self.actor)
+        # resolve actor_obs_dim: prefer user-provided; fallback to inferred; ensure >= inferred if inferred is known
+        if actor_obs_dim is not None:
+            try:
+                actor_obs_dim = int(actor_obs_dim)
+            except Exception:
+                actor_obs_dim = None
+        if actor_obs_dim is None or actor_obs_dim <= 0:
+            actor_obs_dim = inferred
+        if actor_obs_dim is None or actor_obs_dim <= 0:
+            raise RuntimeError(
+                f"Unable to infer actor_obs_dim (provided={actor_obs_dim}, inferred={inferred}). "
+                "Please provide actor_obs_dim explicitly."
+            )
+        if inferred is not None and actor_obs_dim < inferred:
+            actor_obs_dim = inferred
+
+        self.actor_obs_dim = actor_obs_dim
+        self.expected_obs_dim = inferred or self.actor_obs_dim
 
     def _pad_or_trim(self, obs: torch.Tensor) -> torch.Tensor:
-        if self.expected_obs_dim is None:
+        """Ensure obs has expected_obs_dim without tracing-time python branching.
+
+        During ONNX export / tracing, shape values may be Tensors; any python
+        branching on them triggers TracerWarning. In tracing, we simply slice to
+        the expected dimension (slicing is ONNX-friendly). Outside tracing, keep
+        the original pad/trim logic for robustness.
+        """
+        expected = self.actor_obs_dim or self.expected_obs_dim
+        if expected is None:
             return obs
+        # Avoid python bool on Tensor when tracing/onnx export
+        if torch.jit.is_tracing() or torch.onnx.is_in_onnx_export():
+            return obs[:, :expected]
+
         current = obs.shape[1]
-        if current == self.expected_obs_dim:
+        if current == expected:
             return obs
-        if current > self.expected_obs_dim:
-            return obs[:, : self.expected_obs_dim]
-        pad = self.expected_obs_dim - current
+        if current > expected:
+            return obs[:, :expected]
+        pad = expected - current
         if pad <= 0:
             return obs
         zeros = torch.zeros(obs.shape[0], pad, device=obs.device, dtype=obs.dtype)
         return torch.cat([obs, zeros], dim=1)
 
-    def forward(self, actor_obs, vae_obs):
-        del vae_obs
+    def forward(self, actor_obs):
         obs = self._pad_or_trim(actor_obs)
         return _call_actor(self.actor, self.normalizer(obs))
 
@@ -536,111 +516,19 @@ class _OnnxPolicyExporterDualInput(torch.nn.Module):
         self.to("cpu")
         actor_dim = self.actor_obs_dim or self.expected_obs_dim
         if actor_dim is None:
-            raise RuntimeError("Unable to infer actor_obs_dim for dual-input ONNX export.")
-        vae_dim = self.vae_obs_dim or actor_dim
+            raise RuntimeError("Unable to infer actor_obs_dim for ONNX export.")
         actor_obs = torch.zeros(1, actor_dim)
-        vae_obs = torch.zeros(1, vae_dim)
         torch.onnx.export(
             self,
-            (actor_obs, vae_obs),
+            actor_obs,
             os.path.join(path, filename),
             export_params=True,
             opset_version=11,
             verbose=self.verbose,
-            input_names=["actor_obs", "vae_obs"],
+            input_names=["actor_obs"],
             output_names=["actions"],
             dynamic_axes={},
         )
-
-class OnnxAmpVaeExporter(torch.nn.Module):
-    """
-    Exporter of combined VAE encoder and Actor network to a single ONNX file,
-    integrating VAE output into Actor input, with dynamic batch support.
-    """
-
-    def __init__(self, actor, vae, verbose=False):
-        super().__init__()
-        self.verbose = verbose
-        # Deep copy sub-modules to CPU
-        self.actor = copy.deepcopy(actor).cpu()
-        self.vae = copy.deepcopy(vae).cpu()
-
-    def forward(self, actor_obs, vae_obs):
-        # 1) VAE encoding (deterministic)
-        code = self.vae.act_inference(vae_obs)
-        # 2) Concatenate VAE code and actor observations
-        full_obs = torch.cat((code, actor_obs), dim=-1)
-        # 3) Actor network produces actions
-        actions = self.actor.act_inference(full_obs)
-        return actions
-
-    def export(self, path, filename):
-        """Export the combined model to ONNX at path/filename"""
-        self.cpu()
-        self.eval()
-        self.actor.eval()
-        self.vae.eval()
-        full_path = os.path.join(path, filename)
-
-        def _first_linear_in_features(module: torch.nn.Module) -> int | None:
-            for m in module.modules():
-                if isinstance(m, torch.nn.Linear):
-                    return int(m.in_features)
-            return None
-
-        # 1) Infer full input dimension for actor (code + actor_obs)
-        actor_in = None
-        # Prefer the actual actor sub-network if present (avoid accidentally picking critic layers).
-        actor_subnet = getattr(self.actor, "actor", None)
-        if isinstance(actor_subnet, torch.nn.Module):
-            actor_in = _first_linear_in_features(actor_subnet)
-        if actor_in is None:
-            # Fallback: scan the whole module (works if `actor` is already an actor-only module).
-            actor_in = _first_linear_in_features(self.actor)
-        if actor_in is None:
-            raise RuntimeError("Unable to infer actor input dimension")
-
-        # 2) Infer VAE observation dimension from first Linear in encoder
-        vae_in = None
-        vae_encoder = getattr(self.vae, "encoder", None)
-        if isinstance(vae_encoder, torch.nn.Module):
-            vae_in = _first_linear_in_features(vae_encoder)
-        if vae_in is None:
-            vae_in = _first_linear_in_features(self.vae)
-        if vae_in is None:
-            raise RuntimeError("Unable to infer VAE input dimension")
-
-        # 3) Compute code dimension by running dummy through VAE
-        dummy_vae = torch.zeros(1, vae_in)
-        with torch.no_grad():
-            code = self.vae.act_inference(dummy_vae)
-        code_dim = code.shape[1]
-
-        # 4) Actor obs dimension = actor_in - code_dim
-        actor_obs_dim = actor_in - code_dim
-        if actor_obs_dim <= 0:
-            raise RuntimeError(f"Inferred actor_obs_dim={actor_obs_dim} invalid")
-        dummy_actor = torch.zeros(1, actor_obs_dim)
-
-        # Specify dynamic axes for batch dimension
-        dynamic_axes = {
-            "actor_obs": {0: "batch_size"},
-            "vae_obs": {0: "batch_size"},
-            "actions": {0: "batch_size"},
-        }
-        # Export to ONNX
-        torch.onnx.export(
-            self,
-            (dummy_actor, dummy_vae),
-            full_path,
-            export_params=True,
-            opset_version=11,
-            verbose=self.verbose,
-            input_names=["actor_obs", "vae_obs"],
-            output_names=["actions"],
-            dynamic_axes=dynamic_axes,
-        )
-        print(f"Saved ONNX combined Actor+VAE model to {full_path}")
 
 
 def export_inference_cfg(
@@ -665,7 +553,7 @@ def export_inference_cfg(
     policy_cfg_dict["joint_names"] = joint_names
     policy_cfg_dict["default_joint_pos"] = _extract_joint_defaults(env, joint_names)
 
-    policy_cfg_dict["input_names"] = ["actor_obs", "vae_obs"]
+    policy_cfg_dict["input_names"] = ["actor_obs"]
     policy_cfg_dict["output_names"] = ["actions"]
 
     actor_obs_names = _extract_obs_terms(env)
@@ -685,7 +573,6 @@ def export_inference_cfg(
     if include_action_hist and "action_hist" not in actor_obs_names:
         actor_obs_names.append("action_hist")
     policy_cfg_dict["input_actor_obs_names"] = actor_obs_names
-    policy_cfg_dict["input_vae_obs_names"] = actor_obs_names
 
     obs_scales = _extract_obs_scales(env)
     obs_name_map = getattr(obs_summary, "export_name_map", None)
@@ -700,7 +587,6 @@ def export_inference_cfg(
         actor_obs_names = mapped_names
         obs_scales = mapped_scales
         policy_cfg_dict["input_actor_obs_names"] = actor_obs_names
-        policy_cfg_dict["input_vae_obs_names"] = actor_obs_names
     for name in actor_obs_names:
         if name not in obs_scales:
             obs_scales[name] = 1.0
@@ -711,10 +597,7 @@ def export_inference_cfg(
         return _safe_float(val, 1.0)
 
     input_actor_obs_scales = {name: _normalize_scale(obs_scales[name]) for name in actor_obs_names}
-    input_vae_obs_scales = dict(input_actor_obs_scales)
-
     policy_cfg_dict["input_actor_obs_scales"] = input_actor_obs_scales
-    policy_cfg_dict["input_vae_obs_scales"] = input_vae_obs_scales
     obs_mgr = env.unwrapped.observation_manager
     group = _resolve_obs_group(obs_mgr)
     group_dims = getattr(obs_mgr, "group_obs_dim", {})
@@ -724,13 +607,7 @@ def export_inference_cfg(
         actor_obs_dim = int(dim[0] if isinstance(dim, (list, tuple)) else dim)
     if actor_obs_dim is None:
         actor_obs_dim = int(len(actor_obs_names))
-    vae_obs_dim = getattr(env_summary, "num_vae_obs", None)
-    if vae_obs_dim is None:
-        vae_obs_dim = actor_obs_dim
-    policy_cfg_dict["input_obs_size_map"] = {
-        "actor_obs": int(actor_obs_dim),
-        "vae_obs": int(vae_obs_dim),
-    }
+    policy_cfg_dict["input_obs_size_map"] = {"actor_obs": int(actor_obs_dim)}
     action_scale = getattr(action_summary, "scale", None)
     if action_scale is None:
         action_scale = getattr(getattr(env_cfg, "actions", None), "joint_pos", None)
@@ -748,10 +625,7 @@ def export_inference_cfg(
     if clip_obs is None:
         clip_obs = 100.0
     policy_cfg_dict["clip_obs"] = _safe_float(clip_obs, 100.0)
-    policy_cfg_dict["obs_history_length"] = {
-        "actor_obs": 1,
-        "vae_obs": max(1, int(getattr(env_summary, "obs_history_length", 1) or 1)),
-    }
+    policy_cfg_dict["obs_history_length"] = {"actor_obs": 1}
 
     kp, kd, max_torques = _extract_actuator_vectors(env, joint_names)
     policy_cfg_dict["joint_kp"] = [float(f"{x:.4f}") for x in kp]
@@ -790,9 +664,7 @@ def export_inference_cfg(
     print("input_names:", policy_cfg_dict["input_names"])
     print("output_names:", policy_cfg_dict["output_names"])
     print("input_actor_obs_names:", policy_cfg_dict["input_actor_obs_names"])
-    print("input_vae_obs_names:", policy_cfg_dict["input_vae_obs_names"])
     print("input_actor_obs_scales:", policy_cfg_dict["input_actor_obs_scales"])
-    print("input_vae_obs_scales:", policy_cfg_dict["input_vae_obs_scales"])
     print("input_obs_size_map:", policy_cfg_dict["input_obs_size_map"])
     print("action_scale:", policy_cfg_dict["action_scale"])
     print("clip_actions:", policy_cfg_dict["clip_actions"])
@@ -842,34 +714,28 @@ def export_inference_cfg_to_yaml(config_dict, path, load_run, checkpoint):
 
     # input_obs_names_map 多行缩进
     content += "input_obs_names_map:\n  {\n"
-    for key, obs_list in (("actor_obs", config_dict["input_actor_obs_names"]), ("vae_obs", config_dict["input_vae_obs_names"])):
-        content += f"    {key}: ["
-        content += ", ".join(f'"{o}"' for o in obs_list)
-        content += "],\n"
-    content += "  }\n"
+    content += "    actor_obs: ["
+    content += ", ".join(f'"{o}"' for o in config_dict["input_actor_obs_names"])
+    content += "],\n  }\n"
 
     # input_obs_scales_map 多行缩进，并区分标量／列表
-    content += "input_obs_scales_map:\n  {\n"
-    for key, obs_list, scales in (
-        ("actor_obs", config_dict["input_actor_obs_names"], config_dict["input_actor_obs_scales"]),
-        ("vae_obs", config_dict["input_vae_obs_names"], config_dict["input_vae_obs_scales"]),
-    ):
-        content += f"    {key}: {{ "
-        parts = []
-        for obs in obs_list:
-            val = scales.get(obs, 1.0)
-            if isinstance(val, list):
-                sval = "[" + ", ".join(f"{x}" for x in val) + "]"
-            else:
-                sval = f"{val}"
-            parts.append(f"{obs}: {sval}")
-        content += ", ".join(parts)
-        content += " },\n"
-    content += "  }\n"
+    scales = config_dict["input_actor_obs_scales"]
+    obs_list = config_dict["input_actor_obs_names"]
+    content += "input_obs_scales_map:\n  {\n    actor_obs: { "
+    parts = []
+    for obs in obs_list:
+        val = scales.get(obs, 1.0)
+        if isinstance(val, list):
+            sval = "[" + ", ".join(f"{x}" for x in val) + "]"
+        else:
+            sval = f"{val}"
+        parts.append(f"{obs}: {sval}")
+    content += ", ".join(parts)
+    content += " },\n  }\n"
 
     content += "input_obs_size_map:\n  {\n"
-    for key, scales in config_dict["input_obs_size_map"].items():
-        content += f"    {key}: {scales},\n"
+    for key, dim in config_dict["input_obs_size_map"].items():
+        content += f"    {key}: {dim},\n"
     content += "  }\n"
 
     # 其余字段

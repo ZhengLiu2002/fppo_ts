@@ -210,15 +210,19 @@ def main():
     try:
         base_env = env.unwrapped
         if hasattr(base_env, "max_episode_length"):
-            new_len = int(
-                base_env.max_episode_length * 100
-            )  # effectively disable time-out for play
-            base_env.max_episode_length = new_len
-            if hasattr(base_env, "cfg") and hasattr(base_env.cfg, "episode_length_s"):
-                base_env.cfg.episode_length_s = base_env.cfg.episode_length_s * 100.0
-            print(
-                f"[INFO] Play mode: time-out relaxed to {new_len} steps (goal/fall still terminate)."
-            )
+            prop = getattr(type(base_env), "max_episode_length", None)
+            can_set = not isinstance(prop, property) or prop.fset is not None
+            if can_set:
+                new_len = int(base_env.max_episode_length * 100)  # effectively disable time-out for play
+                base_env.max_episode_length = new_len
+                if hasattr(base_env, "cfg") and hasattr(base_env.cfg, "episode_length_s"):
+                    base_env.cfg.episode_length_s = base_env.cfg.episode_length_s * 100.0
+                print(
+                    f"[INFO] Play mode: time-out relaxed to {new_len} steps (goal/fall still terminate)."
+                )
+            else:
+                # Read-only property (e.g., CRLManagerBasedRLEnv); keep original to avoid warnings.
+                print("[INFO] Play mode: max_episode_length is read-only; skip relaxing time-out.")
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[WARN] Failed to relax play time-out: {exc}")
 
@@ -267,7 +271,6 @@ def main():
         path=export_model_dir,
         filename="policy.onnx",
         actor_obs_dim=export_cfg["input_obs_size_map"]["actor_obs"],
-        vae_obs_dim=export_cfg["input_obs_size_map"]["vae_obs"],
     )
 
     dt = env.unwrapped.step_dt

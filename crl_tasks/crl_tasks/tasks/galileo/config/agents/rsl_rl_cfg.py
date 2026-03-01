@@ -93,6 +93,21 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     preconditioner_eps: float = 1e-8
     feasible_first: bool = True
     feasible_first_coef: float = 1.0
+    feasible_cost_margin: float = 1e-3
+    infeasible_improve_ratio: float = 0.01
+    infeasible_improve_abs: float = 1e-3
+    min_step_size: float = 1e-7
+    relax_cost_margin: float = 0.2
+    step_size_adaptive: bool = True
+    step_size_up: float = 1.02
+    step_size_down: float = 0.7
+    step_size_min: float = 5e-5
+    step_size_max: float = 2e-3
+    target_accept_rate: float = 0.75
+    step_size_cost_margin: float = 0.2
+    k_decay: float = 1.0
+    k_min: float = 0.0
+    k_violation_threshold: float = 0.02
     # NP3O-style positive-part cost shaping (shared across constrained algorithms)
     cost_viol_loss_coef: float = 0.0
     k_value: float = 1.0

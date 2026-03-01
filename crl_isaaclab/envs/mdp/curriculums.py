@@ -23,9 +23,14 @@ def terrain_levels_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    episodes_per_level: int | None = None,
+    move_up_ratio: float = 0.5,
+    move_down_ratio: float = 0.5,
 ) -> torch.Tensor:
-    """Update terrain levels based on distance walked under velocity commands."""
+    """Update terrain levels based on distance walked under velocity commands.
+
+    - If the robot walks farther than terrain.size * move_up_ratio -> move up.
+    - If it walks much less than commanded distance * move_down_ratio -> move down.
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
     command = env.command_manager.get_command("base_velocity")
@@ -33,19 +38,9 @@ def terrain_levels_vel(
     distance = torch.norm(
         asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
     )
-    # 更宽松的晋级阈值，鼓励更快推进地形关卡
-    move_up = distance > terrain.cfg.terrain_generator.size[0] * 0.25
-    # 放宽降级条件，避免频繁回退
-    move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.3
+    move_up = distance > terrain.cfg.terrain_generator.size[0] * move_up_ratio
+    move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * move_down_ratio
     move_down *= ~move_up
-    if episodes_per_level is not None and episodes_per_level > 0:
-        max_episode_length = env.max_episode_length
-        min_steps = (
-            (terrain.terrain_levels[env_ids].float() + 1.0)
-            * max_episode_length
-            * episodes_per_level
-        )
-        move_up &= env.common_step_counter > min_steps
 
     terrain.update_env_origins(env_ids, move_up, move_down)
     return torch.mean(terrain.terrain_levels.float())
@@ -54,6 +49,7 @@ def terrain_levels_vel(
 def lin_vel_x_command_threshold(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], episodes_per_level: int = 8
 ) -> torch.Tensor:
+    """Time-based curriculum: gradually widen lin_vel_x command range."""
     command = env.command_manager.get_term("base_velocity")
     max_episode_length = env.max_episode_length
     lin_x_level = float(getattr(command.cfg, "lin_x_level", 0.0))
@@ -71,8 +67,7 @@ def lin_vel_x_command_threshold(
             lin_x_level = max_lin_x_level
         command.cfg.lin_x_level = lin_x_level
 
-    # Always apply the current curriculum level to the command ranges (keeps cfg consistent
-    # even when the level hasn't changed yet).
+    # Always apply the current curriculum level to the command ranges.
     denom = max(float(max_lin_x_level), 1.0e-6)
     ranges = command.cfg.ranges
     if (
@@ -93,6 +88,7 @@ def lin_vel_x_command_threshold(
 def ang_vel_z_command_threshold(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], episodes_per_level: int = 8
 ) -> torch.Tensor:
+    """Time-based curriculum: gradually widen ang_vel_z command range."""
     command = env.command_manager.get_term("base_velocity")
     max_episode_length = env.max_episode_length
     ang_z_level = float(getattr(command.cfg, "ang_z_level", 0.0))

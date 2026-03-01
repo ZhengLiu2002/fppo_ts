@@ -350,17 +350,27 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                         rewards.to(self.device),
                         dones.to(self.device),
                     )
+                    # sanitize rewards to avoid NaN/Inf propagating into returns/advantages
+                    rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0e3, neginf=-1.0e3)
+                    rewards = torch.clamp(rewards, min=-1.0e3, max=1.0e3)
                     # perform normalization
                     obs = self.obs_normalizer(obs)
+                    obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
                             infos["observations"][self.privileged_obs_type].to(self.device)
                         )
                     else:
                         privileged_obs = obs
+                    privileged_obs = torch.nan_to_num(
+                        privileged_obs, nan=0.0, posinf=1.0e6, neginf=-1.0e6
+                    )
 
                     # process the step
                     costs = self._extract_costs(infos, rewards)
+                    if costs is not None:
+                        costs = torch.nan_to_num(costs, nan=0.0, posinf=1.0e3, neginf=-1.0e3)
+                        costs = torch.clamp(costs, min=-1.0e3, max=1.0e3)
                     self.alg.process_env_step(obs, rewards, dones, infos, costs=costs)
 
                     # Extract intrinsic rewards (only for logging)

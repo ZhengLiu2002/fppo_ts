@@ -53,6 +53,34 @@ LOG_RUN_NAME=fppo python scripts/rsl_rl/train.py \
   --algo fppo --num_envs 4096 --max_iterations 50000 --run_name student --headless \
   --logger wandb --log_project_name galileo_fppo
 ```
+示例：np3o
+```bash
+# Teacher
+LOG_RUN_NAME=np3o python scripts/rsl_rl/train.py \
+  --task Isaac-Galileo-CRL-Teacher-v0 \
+  --algo np3o --num_envs 4096 --max_iterations 50000 --run_name teacher --headless \
+  --logger wandb --log_project_name galileo_np3o
+
+# Student
+LOG_RUN_NAME=np3o python scripts/rsl_rl/train.py \
+  --task Isaac-Galileo-CRL-Student-v0 \
+  --algo np3o --num_envs 4096 --max_iterations 50000 --run_name student --headless \
+  --logger wandb --log_project_name galileo_np3o
+```
+示例：ppo_lagrange
+```bash
+# Teacher
+LOG_RUN_NAME=ppo_lagrange python scripts/rsl_rl/train.py \
+  --task Isaac-Galileo-CRL-Teacher-v0 \
+  --algo ppo_lagrange --num_envs 4096 --max_iterations 50000 --run_name teacher --headless \
+  --logger wandb --log_project_name galileo_ppo_lagrange
+
+# Student
+LOG_RUN_NAME=ppo_lagrange python scripts/rsl_rl/train.py \
+  --task Isaac-Galileo-CRL-Student-v0 \
+  --algo ppo_lagrange --num_envs 4096 --max_iterations 50000 --run_name student --headless \
+  --logger wandb --log_project_name galileo_ppo_lagrange
+```
 
 ***如果多次用同一个 LOG_RUN_NAME，日志和 checkpoint 会写到同一个目录，可能覆盖或混在一起。***
 

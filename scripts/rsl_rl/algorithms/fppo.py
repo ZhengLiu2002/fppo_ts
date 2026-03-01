@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,7 +31,9 @@ class FPPO(PPO):
         learning_rate=1e-3,
         step_size=1e-3,
         cost_limit=0.0,
-        delta_safe=0.01,
+        # 安全相关：参数空间安全半径、成本安全裕度
+        delta_safe=0.01,  # reinterpret as parameter-space safe radius (Δ_safe)
+        epsilon_safe=0.0,  # cost tightening margin
         backtrack_coeff=0.5,
         max_backtracks=10,
         projection_eps=1e-8,
@@ -49,17 +50,29 @@ class FPPO(PPO):
         k_growth: float = 1.0,
         k_max: float = 1.0,
         use_preconditioner: bool = True,
+        use_momentum: bool = True,
+        momentum_beta: float = 0.9,
         preconditioner_beta: float = 0.999,
         preconditioner_eps: float = 1e-8,
+        slack_penalty: float = 1.0,
         feasible_first: bool = True,
         feasible_first_coef: float = 1.0,
-        # VAE auxiliary parameters
-        learning_rate_vae: float = 2.0e-3,
-        vae_beta: float = 0.01,
-        vae_beta_min: float = 1.0e-4,
-        vae_beta_max: float = 0.1,
-        vae_desired_recon_loss: float = 0.1,
-        derived_action_loss_weight: float = 0.0,
+        projection_scale_clip: float = 1.0e3,
+        feasible_cost_margin: float = 1.0e-3,
+        infeasible_improve_ratio: float = 0.01,
+        infeasible_improve_abs: float = 1.0e-3,
+        min_step_size: float = 1.0e-7,
+        relax_cost_margin: float = 0.2,
+        step_size_adaptive: bool = True,
+        step_size_up: float = 1.02,
+        step_size_down: float = 0.7,
+        step_size_min: float = 5.0e-5,
+        step_size_max: float = 2.0e-3,
+        target_accept_rate: float = 0.75,
+        step_size_cost_margin: float = 0.2,
+        k_decay: float = 1.0,
+        k_min: float = 0.0,
+        k_violation_threshold: float = 0.02,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -88,16 +101,12 @@ class FPPO(PPO):
             k_value=k_value,
             k_growth=k_growth,
             k_max=k_max,
-            learning_rate_vae=learning_rate_vae,
-            vae_beta=vae_beta,
-            vae_beta_min=vae_beta_min,
-            vae_beta_max=vae_beta_max,
-            vae_desired_recon_loss=vae_desired_recon_loss,
-            derived_action_loss_weight=derived_action_loss_weight,
             multi_gpu_cfg=multi_gpu_cfg,
         )
         self.step_size = step_size
-        self.delta_safe = delta_safe
+        # reinterpret delta_safe as parameter-space safe radius Δ_safe (norm on update)
+        self.safe_radius = delta_safe
+        self.epsilon_safe = epsilon_safe
         self.backtrack_coeff = backtrack_coeff
         self.max_backtracks = max_backtracks
         self.projection_eps = projection_eps
@@ -105,30 +114,44 @@ class FPPO(PPO):
         self.learning_rate = step_size
         self.critic_learning_rate = learning_rate
         self.use_preconditioner = use_preconditioner
+        self.use_momentum = use_momentum
+        self.momentum_beta = momentum_beta
         self.preconditioner_beta = preconditioner_beta
         self.preconditioner_eps = preconditioner_eps
+        self.slack_penalty = slack_penalty
         self.feasible_first = feasible_first
         self.feasible_first_coef = feasible_first_coef
+        self.projection_scale_clip = projection_scale_clip
+        self.feasible_cost_margin = float(feasible_cost_margin)
+        self.infeasible_improve_ratio = float(infeasible_improve_ratio)
+        self.infeasible_improve_abs = float(infeasible_improve_abs)
+        self.min_step_size = float(min_step_size)
+        self.relax_cost_margin = float(relax_cost_margin)
+        self.step_size_adaptive = bool(step_size_adaptive)
+        self.step_size_up = float(step_size_up)
+        self.step_size_down = float(step_size_down)
+        self.step_size_min = float(step_size_min)
+        self.step_size_max = float(step_size_max)
+        self.target_accept_rate = float(target_accept_rate)
+        self.step_size_cost_margin = float(step_size_cost_margin)
+        self.k_decay = float(k_decay)
+        self.k_min = float(k_min)
+        self.k_violation_threshold = float(k_violation_threshold)
 
         critic_params = list(self.policy.critic.parameters()) + list(
             self.policy.cost_critic.parameters()
         )
         self.optimizer = {"critic": optim.Adam(critic_params, lr=learning_rate)}
-        # Optional VAE optimizer (auxiliary)
-        self.vae_optimizer = None
-        if (
-            getattr(self.policy, "vae_enabled", False)
-            and getattr(self.policy, "vae", None) is not None
-        ):
-            vae_lr = getattr(self.policy, "vae_learning_rate", None)
-            if vae_lr is None:
-                vae_lr = learning_rate
-            self.vae_optimizer = optim.Adam(self.policy.vae.parameters(), lr=vae_lr)
 
         self._actor_params = self._get_actor_params()
         self._precond_v = None
         if self.use_preconditioner:
             self._precond_v = [
+                torch.zeros_like(param, device=self.device) for param in self._actor_params
+            ]
+        self._momentum = None
+        if self.use_momentum:
+            self._momentum = [
                 torch.zeros_like(param, device=self.device) for param in self._actor_params
             ]
         self.train_metrics: dict[str, float] = {}
@@ -138,17 +161,11 @@ class FPPO(PPO):
         mean_cost_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
-        mean_kl = 0.0
         mean_viol_loss = 0.0
         mean_cost_return = 0.0
         mean_cost_violation = 0.0
         mean_step_size = 0.0
-        mean_vae_vel_loss = 0.0
-        mean_vae_mass_loss = 0.0
-        mean_vae_decode_loss = 0.0
-        mean_vae_kl_loss = 0.0
-        mean_vae_beta = 0.0
-        mean_derived_action_loss = 0.0
+        accepted_updates = 0
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -178,10 +195,7 @@ class FPPO(PPO):
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
-            actor_obs_batch,
-            vae_obs_history_batch,
-            next_actor_obs_batch,
-            amp_obs_batch,
+            *_,
         ) in generator:
             # Normalize advantages per mini-batch if requested.
             if self.normalize_advantage_per_mini_batch:
@@ -193,6 +207,24 @@ class FPPO(PPO):
                         cost_advantages_batch = (
                             cost_advantages_batch - cost_advantages_batch.mean()
                         ) / (cost_advantages_batch.std() + 1e-8)
+            advantages_batch = self._sanitize_tensor(
+                advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            )
+            cost_advantages_batch = self._sanitize_tensor(
+                cost_advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            )
+            returns_batch = self._sanitize_tensor(
+                returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            cost_returns_batch = self._sanitize_tensor(
+                cost_returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            target_values_batch = self._sanitize_tensor(
+                target_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
+            cost_values_batch = self._sanitize_tensor(
+                cost_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
 
             # Actor forward pass
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -201,7 +233,7 @@ class FPPO(PPO):
             sigma_batch = self.policy.action_std
             entropy_batch = self.policy.entropy
 
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            ratio = self._safe_ratio(actions_log_prob_batch, old_actions_log_prob_batch)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_loss = surrogate
             if self.use_clipped_surrogate:
@@ -212,10 +244,18 @@ class FPPO(PPO):
             surrogate_loss = surrogate_loss.mean()
             cost_surrogate = (torch.squeeze(cost_advantages_batch) * ratio).mean()
             policy_loss = surrogate_loss - self.entropy_coef * entropy_batch.mean()
+            surrogate_loss = self._sanitize_tensor(
+                surrogate_loss, nan=0.0, posinf=1.0e6, neginf=-1.0e6, clamp=1.0e6
+            )
 
             # Compute reward and cost gradients for projection.
             g = torch.autograd.grad(policy_loss, self._actor_params, retain_graph=True)
             g = [(-gi).detach() for gi in g]
+            if self.use_momentum and self._momentum is not None:
+                with torch.no_grad():
+                    for m, gi in zip(self._momentum, g):
+                        m.mul_(self.momentum_beta).add_(gi, alpha=1 - self.momentum_beta)
+                g = [m.detach() for m in self._momentum]
             g_c = torch.autograd.grad(cost_surrogate, self._actor_params, retain_graph=False)
             g_c = [gci.detach() for gci in g_c]
 
@@ -226,15 +266,23 @@ class FPPO(PPO):
             dot_gc_g = self._sum_grads_product(g_c, g)
             gc_norm_sq = self._sum_grads_product(g_c, g_c)
 
-            cost_return_mean = cost_returns_batch.mean()
-            if self.is_multi_gpu:
-                cost_return_mean = self._all_reduce_mean(cost_return_mean)
-            c_hat = cost_return_mean - self.cost_limit
+            cost_return_mean, batch_cost_violation, _ = self._batch_cost_stats(cost_returns_batch)
+            # tightened cost limit: d' = d - epsilon_safe
+            effective_cost_limit = self.cost_limit - self.epsilon_safe
+            effective_cost_limit_t = torch.as_tensor(
+                effective_cost_limit, device=cost_return_mean.device, dtype=cost_return_mean.dtype
+            )
+            c_hat = cost_return_mean - effective_cost_limit_t
             c_hat_proj = self.k_value * c_hat
-            if self.feasible_first and c_hat_proj > 0 and dot_gc_g.item() > 0.0:
+            cost_slack = effective_cost_limit_t - cost_return_mean
+            relax_projection = cost_slack.item() >= self.relax_cost_margin
+            if self.feasible_first and c_hat_proj.item() > 0.0 and dot_gc_g.item() > 0.0:
                 g = [gi - self.feasible_first_coef * gci for gi, gci in zip(g, g_c)]
                 dot_gc_g = self._sum_grads_product(g_c, g)
             viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat)
+            viol_loss = self._sanitize_tensor(
+                viol_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             inv_precond = None
             if self.use_preconditioner:
@@ -243,39 +291,93 @@ class FPPO(PPO):
 
             base_params = [param.data.clone() for param in self._actor_params]
             alpha = self.step_size
-            kl_mean = torch.tensor(0.0, device=self.device)
 
-            # Backtracking line search with projection to ensure KL divergence constraint is satisfied.
-            if self.delta_safe is None or self.max_backtracks <= 0:
-                v = self._project_direction(
-                    g, g_c, dot_gc_g, gc_norm_sq, c_hat_proj, alpha, inv_precond
-                )
-                self._apply_update(self._actor_params, base_params, v, alpha)
-                kl_mean = self._compute_kl(
-                    obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
-                )
+            # Backtracking line search with soft projection + KL/cost checks
+            accepted = False
+            for _ in range(self.max_backtracks + 1):
+                # 1) Nominal PPO step
+                self._apply_update(self._actor_params, base_params, g, alpha)
+                if not relax_projection:
+                    # 2) Soft projection onto linearized cost constraint
+                    #    Compute violation v = A^T (theta'-theta_k) - b, where b = d' - J_C
+                    diff = [p.data - b for p, b in zip(self._actor_params, base_params)]
+                    dot_gc_diff = self._sum_grads_product(g_c, diff)
+                    v_scalar = dot_gc_diff - (effective_cost_limit - cost_return_mean)
+                    if self.use_preconditioner and inv_precond is not None:
+                        q_scalar = (
+                            self._sum_grads_product(
+                                [gci * invi for gci, invi in zip(g_c, inv_precond)], g_c
+                            )
+                            + 1.0 / self.slack_penalty
+                        )
+                    else:
+                        q_scalar = gc_norm_sq + 1.0 / self.slack_penalty
+                    lambda_star = torch.clamp(v_scalar / (q_scalar + self.projection_eps), min=0.0)
+                    if self.use_preconditioner and inv_precond is not None:
+                        proj_direction = [
+                            gci * invi * lambda_star for gci, invi in zip(g_c, inv_precond)
+                        ]
+                    else:
+                        proj_direction = [gci * lambda_star for gci in g_c]
+                    for param, proj_dir in zip(self._actor_params, proj_direction):
+                        param.data.add_(-proj_dir)
+
+                # 3) Acceptance: KL and cost check (importance weighted, clipped)
+                with torch.inference_mode():
+                    kl_mean = self._compute_kl(
+                        obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
+                    )
+                    kl_mean = self._sanitize_tensor(
+                        kl_mean, nan=1.0e6, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+                    )
+                    kl_limit = self.desired_kl if self.desired_kl is not None else float("inf")
+                    if relax_projection:
+                        cost_check = cost_return_mean
+                        cost_accept_limit = cost_return_mean + self.feasible_cost_margin
+                    else:
+                        # IS-clipped cost estimate
+                        self.policy.act(
+                            obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
+                        )
+                        new_log_prob = self.policy.get_actions_log_prob(actions_batch)
+                        ratio = self._safe_ratio(new_log_prob, old_actions_log_prob_batch)
+                        ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+                        cost_check = (ratio.unsqueeze(-1) * cost_returns_batch).mean()
+                        cost_check = self._sanitize_tensor(
+                            cost_check, nan=1.0e6, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+                        )
+
+                        # Infeasible phase: require monotonic cost reduction.
+                        if cost_return_mean.item() <= effective_cost_limit_t.item():
+                            cost_accept_limit = effective_cost_limit_t + self.feasible_cost_margin
+                        else:
+                            improve_rel = torch.abs(cost_return_mean) * self.infeasible_improve_ratio
+                            improve_abs = torch.as_tensor(
+                                self.infeasible_improve_abs,
+                                device=cost_return_mean.device,
+                                dtype=cost_return_mean.dtype,
+                            )
+                            required_improve = torch.maximum(improve_rel, improve_abs)
+                            cost_accept_limit = cost_return_mean - required_improve
+
+                if kl_mean <= kl_limit and cost_check <= cost_accept_limit:
+                    accepted = True
+                    break
+
+                # backtrack: restore and shrink step
+                for param, base in zip(self._actor_params, base_params):
+                    param.data.copy_(base)
+                alpha *= self.backtrack_coeff
+                if alpha < self.min_step_size:
+                    break
+
+            if not accepted:
+                # Revert if no acceptable step found
+                for param, base in zip(self._actor_params, base_params):
+                    param.data.copy_(base)
+                alpha = 0.0
             else:
-                accepted = False
-                for _ in range(self.max_backtracks + 1):
-                    v = self._project_direction(
-                        g, g_c, dot_gc_g, gc_norm_sq, c_hat_proj, alpha, inv_precond
-                    )
-                    self._apply_update(self._actor_params, base_params, v, alpha)
-                    kl_mean = self._compute_kl(
-                        obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
-                    )
-                    if kl_mean <= self.delta_safe:
-                        accepted = True
-                        break
-                    alpha *= self.backtrack_coeff
-                if not accepted:
-                    # Backtracking failed to satisfy KL safety bound; revert actor update.
-                    for param, base in zip(self._actor_params, base_params):
-                        param.data.copy_(base)
-                    alpha = 0.0
-                    kl_mean = self._compute_kl(
-                        obs_batch, old_mu_batch, old_sigma_batch, masks_batch, hid_states_batch[0]
-                    )
+                accepted_updates += 1
 
             # Critic updates
             value_batch = self.policy.evaluate(
@@ -294,6 +396,9 @@ class FPPO(PPO):
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
+            value_loss = self._sanitize_tensor(
+                value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             if self.use_clipped_value_loss:
                 cost_value_clipped = cost_values_batch + (
@@ -304,9 +409,15 @@ class FPPO(PPO):
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
             else:
                 cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
+            cost_value_loss = self._sanitize_tensor(
+                cost_value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             critic_loss = (
                 self.value_loss_coef * value_loss + self.cost_value_loss_coef * cost_value_loss
+            )
+            critic_loss = self._sanitize_tensor(
+                critic_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
             )
             self.optimizer["critic"].zero_grad()
             critic_loss.backward()
@@ -318,101 +429,15 @@ class FPPO(PPO):
             )
             self.optimizer["critic"].step()
 
-            # Optional VAE update
-            if (
-                self.vae_optimizer is not None
-                and getattr(self.policy, "vae_enabled", False)
-                and self.policy.vae is not None
-                and vae_obs_history_batch is not None
-                and next_actor_obs_batch is not None
-            ):
-                (
-                    _vae_code,
-                    vae_code_vel,
-                    vae_code_mass,
-                    _vae_code_latent,
-                    vae_decoded,
-                    _vae_mean_vel,
-                    _vae_logvar_vel,
-                    vae_mean_latent,
-                    vae_logvar_latent,
-                    _vae_mean_mass,
-                    _vae_logvar_mass,
-                ) = self.policy.vae.cenet_forward(vae_obs_history_batch, deterministic=False)
-
-                vel_slice = self._resolve_critic_obs_slice("base_lin_vel", slice(0, 3))
-                mass_slice = self._resolve_critic_obs_slice("random_mass", slice(-1, None))
-                vae_vel_target = critic_obs_batch[:, vel_slice]
-                vae_mass_target = critic_obs_batch[:, mass_slice]
-                vae_decode_target = next_actor_obs_batch
-                recon_dim = min(vae_decoded.shape[1], vae_decode_target.shape[1])
-                vae_decoded = vae_decoded[:, :recon_dim]
-                vae_decode_target = vae_decode_target[:, :recon_dim]
-
-                loss_recon_vel = nn.MSELoss()(vae_code_vel, vae_vel_target)
-                loss_recon_mass = nn.MSELoss()(vae_code_mass, vae_mass_target)
-                loss_recon_decode = nn.MSELoss()(vae_decoded, vae_decode_target)
-                loss_recon = loss_recon_vel + loss_recon_mass + loss_recon_decode
-
-                k = math.exp(
-                    self.learning_rate_vae
-                    * (self.vae_desired_recon_loss - loss_recon_decode.item())
-                )
-                self.vae_beta = max(self.vae_beta_min, min(self.vae_beta_max, k * self.vae_beta))
-
-                kl_div = -0.5 * torch.sum(
-                    1 + vae_logvar_latent - vae_mean_latent.pow(2) - vae_logvar_latent.exp(), dim=1
-                )
-                kl_loss = self.vae_beta * torch.mean(kl_div)
-
-                derived_action_loss = torch.tensor(0.0, device=self.device)
-                if (
-                    self.derived_action_loss_weight > 0.0
-                    and actor_obs_batch is not None
-                    and amp_obs_batch is not None
-                    and hasattr(self.policy, "get_derived_action")
-                ):
-                    derived = self.policy.get_derived_action(actor_obs_batch)
-                    if derived is not None:
-                        mu, sigma, _ = derived
-                        foot_slice = self._resolve_amp_obs_slice("foot_positions", slice(27, 39))
-                        foot_pos = amp_obs_batch[:, foot_slice].view(mu.shape[0], mu.shape[1], 3)
-                        target_xy = foot_pos[..., :2]
-                        sigma = torch.clamp(sigma, min=1.0e-4)
-                        sigma_sq = sigma**2
-                        diff_sq = torch.sum((target_xy - mu).pow(2), dim=-1)
-                        derived_action_loss = (
-                            diff_sq / (2.0 * sigma_sq) + torch.log(sigma_sq)
-                        ).mean()
-
-                vae_loss = (
-                    loss_recon + kl_loss + self.derived_action_loss_weight * derived_action_loss
-                )
-
-                self.vae_optimizer.zero_grad()
-                vae_loss.backward()
-                self.vae_optimizer.step()
-
-                mean_vae_vel_loss += loss_recon_vel.item()
-                mean_vae_mass_loss += loss_recon_mass.item()
-                mean_vae_decode_loss += loss_recon_decode.item()
-                mean_vae_kl_loss += kl_loss.item()
-                mean_vae_beta += float(self.vae_beta)
-                mean_derived_action_loss += derived_action_loss.item()
-
             # Book keeping
-            self._step_constraint_scale()
+            self._step_constraint_scale(batch_cost_violation.item())
             mean_value_loss += value_loss.item()
             mean_cost_value_loss += cost_value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
-            mean_kl += kl_mean.item()
             mean_viol_loss += viol_loss.item()
             mean_cost_return += cost_return_mean.item()
-            violation_rate = (cost_returns_batch > self.cost_limit).float().mean()
-            if self.is_multi_gpu:
-                violation_rate = self._all_reduce_mean(violation_rate)
-            mean_cost_violation += violation_rate.item()
+            mean_cost_violation += batch_cost_violation.item()
             mean_step_size += alpha
 
         # -- Aggregate
@@ -420,18 +445,13 @@ class FPPO(PPO):
         mean_cost_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
-        mean_kl /= num_updates
         mean_viol_loss /= num_updates
         mean_cost_return /= num_updates
         mean_cost_violation /= num_updates
         mean_step_size /= num_updates
-        if num_updates > 0 and self.vae_optimizer is not None:
-            mean_vae_vel_loss /= num_updates
-            mean_vae_mass_loss /= num_updates
-            mean_vae_decode_loss /= num_updates
-            mean_vae_kl_loss /= num_updates
-            mean_vae_beta /= num_updates
-            mean_derived_action_loss /= num_updates
+        accept_rate = accepted_updates / max(1, num_updates)
+        reject_rate = 1.0 - accept_rate
+        self._adapt_step_size(accept_rate, mean_cost_return)
 
         self.learning_rate = mean_step_size
         self.train_metrics = {
@@ -440,8 +460,10 @@ class FPPO(PPO):
             "cost_violation_rate": mean_cost_violation,
             "viol_loss": mean_viol_loss,
             "k_value": self.k_value,
-            "kl": mean_kl,
             "step_size": mean_step_size,
+            "base_step_size": self.step_size,
+            "accept_rate": accept_rate,
+            "reject_rate": reject_rate,
         }
 
         # -- Clear the storage
@@ -453,19 +475,28 @@ class FPPO(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "viol": mean_viol_loss,
-            **(
-                {
-                    "vae_vel_loss": mean_vae_vel_loss,
-                    "vae_mass_loss": mean_vae_mass_loss,
-                    "vae_decode_loss": mean_vae_decode_loss,
-                    "vae_kl_loss": mean_vae_kl_loss,
-                    "vae_beta": mean_vae_beta,
-                    "derived_action_loss": mean_derived_action_loss,
-                }
-                if self.vae_optimizer is not None
-                else {}
-            ),
         }
+
+    def _step_constraint_scale(self, cost_violation: float | None = None):
+        if cost_violation is None:
+            super()._step_constraint_scale()
+            return
+        if cost_violation > self.k_violation_threshold:
+            self.k_value = min(self.k_max, self.k_value * self.k_growth)
+        else:
+            self.k_value = max(self.k_min, self.k_value * self.k_decay)
+
+    def _adapt_step_size(self, accept_rate: float, mean_cost_return: float):
+        if not self.step_size_adaptive:
+            return
+        effective_limit = self.cost_limit - self.epsilon_safe
+        if (
+            mean_cost_return <= effective_limit - self.step_size_cost_margin
+            and accept_rate >= self.target_accept_rate
+        ):
+            self.step_size = min(self.step_size_max, self.step_size * self.step_size_up)
+        elif mean_cost_return > effective_limit or accept_rate < self.target_accept_rate * 0.5:
+            self.step_size = max(self.step_size_min, self.step_size * self.step_size_down)
 
     def _get_actor_params(self):
         params = list(self.policy.actor.parameters())
@@ -489,6 +520,8 @@ class FPPO(PPO):
         if dot_value <= b_value:
             return g
         scale = (dot_value - b_value) / (gc_norm_value + self.projection_eps)
+        if self.projection_scale_clip is not None and self.projection_scale_clip > 0:
+            scale = max(-self.projection_scale_clip, min(self.projection_scale_clip, scale))
         if inv_precond is None:
             return [gi - scale * gci for gi, gci in zip(g, g_c)]
         return [gi - scale * inv_i * gci for gi, gci, inv_i in zip(g, g_c, inv_precond)]

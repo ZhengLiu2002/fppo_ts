@@ -15,6 +15,44 @@ if TYPE_CHECKING:
 from scripts.rsl_rl.algorithms.registry import get_algorithm_class_name, list_algorithm_names
 
 
+def _apply_algo_profile_if_available(agent_cfg: "RslRlOnPolicyRunnerCfg", algo_name: str) -> None:
+    """Apply task-level algorithm preset when available.
+
+    Some tasks (e.g. Galileo) define per-algorithm hyper-parameter profiles in
+    their defaults module. If the user passes `--algo`, we should switch both
+    class name and hyper-parameters, not only class name.
+    """
+
+    try:
+        from crl_tasks.tasks.galileo.config.defaults import GalileoDefaults
+    except Exception:
+        return
+
+    if not hasattr(agent_cfg, "algorithm"):
+        return
+    algo_cfg = agent_cfg.algorithm
+    if algo_cfg is None:
+        return
+
+    algo_defaults = getattr(GalileoDefaults, "algorithm", None)
+    if algo_defaults is None:
+        return
+
+    merged_params: dict = {}
+    merged_params.update(getattr(algo_defaults, "base", {}))
+    merged_params.update(getattr(algo_defaults, "per_algo", {}).get(algo_name, {}))
+
+    cfg_name = type(agent_cfg).__name__.lower()
+    if "student" in cfg_name:
+        merged_params.update(getattr(algo_defaults, "student_override", {}))
+    else:
+        merged_params.update(getattr(algo_defaults, "teacher_override", {}))
+
+    for key, value in merged_params.items():
+        if hasattr(algo_cfg, key):
+            setattr(algo_cfg, key, value)
+
+
 def add_rsl_rl_args(parser: argparse.ArgumentParser):
     """Add RSL-RL arguments to the parser.
 
@@ -116,6 +154,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.neptune_project = args_cli.log_project_name
 
     if hasattr(args_cli, "algo") and args_cli.algo is not None:
-        agent_cfg.algorithm.class_name = get_algorithm_class_name(args_cli.algo)
+        algo_name = args_cli.algo.strip().lower()
+        agent_cfg.algorithm.class_name = get_algorithm_class_name(algo_name)
+        _apply_algo_profile_if_available(agent_cfg, algo_name)
 
     return agent_cfg

@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Optional, Callable, Dict, Tuple, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 
 from .feature_extractors.state_encoder import *
@@ -326,8 +327,11 @@ class ActorCriticRMA(nn.Module):
     def update_distribution(self, observations, hist_encoding):
         """用最新 actor 输出均值并配合可学习方差构造高斯分布。"""
         mean = self.actor(observations, hist_encoding)
+        # sanitize mean to prevent NaN/Inf blowing up Normal
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
         if self.noise_std_type == "scalar":
-            std = mean * 0.0 + self.std
+            # Softplus keeps std positive while preserving gradient flow.
+            std = mean * 0.0 + F.softplus(self.std)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
         else:

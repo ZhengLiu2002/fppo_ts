@@ -56,10 +56,10 @@ class CommandsCfg:
         resampling_time_range=GalileoDefaults.command.resampling_time_range,
         lin_x_level=GalileoDefaults.command.lin_x_level,
         max_lin_x_level=GalileoDefaults.command.max_lin_x_level,
-        lin_x_level_step=GalileoDefaults.command.lin_x_level,
+        lin_x_level_step=GalileoDefaults.command.lin_x_level_step,
         ang_z_level=GalileoDefaults.command.ang_z_level,
         max_ang_z_level=GalileoDefaults.command.max_ang_z_level,
-        ang_z_level_step=GalileoDefaults.command.ang_z_level,
+        ang_z_level_step=GalileoDefaults.command.ang_z_level_step,
         min_abs_lin_vel_x=GalileoDefaults.command.min_abs_lin_vel_x,
         min_abs_lin_vel_y=GalileoDefaults.command.min_abs_lin_vel_y,
         heading_control_stiffness=GalileoDefaults.command.heading_control_stiffness,
@@ -421,8 +421,9 @@ class StudentRewardsCfg:
         weight=-0.1
     )
     joint_torques_l2 = RewTerm(
-        func=rewards.joint_torques_l2, 
-        weight=-4.0e-07
+        func=rewards.joint_torque_l2,
+        weight=-4.0e-07,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
     joint_vel_l2 = RewTerm(
         func=rewards.joint_vel_l2, 
@@ -510,11 +511,11 @@ class TeacherRewardsCfg:
 
     track_lin_vel_xy_exp = RewTerm(
         func=rewards.track_lin_vel_xy_exp,
-        weight=5.,
+        weight=5.0,
         params={
             "command_name": "base_velocity",
             "std": 0.25,
-            "min_command_speed": 0.0,
+            "min_command_speed": 0.05,
         },
     )
     track_ang_vel_z_exp = RewTerm(
@@ -523,12 +524,12 @@ class TeacherRewardsCfg:
         params={
             "command_name": "base_velocity",
             "std": 0.25,
-            "min_command_speed": 0.0,
+            "min_command_speed": 0.05,
         },
     )
     flat_orientation_l2 = RewTerm(
         func=rewards.flat_orientation_l2, 
-        weight=-0.08,
+        weight=-0.5,
     )
     base_height_l2_fix = RewTerm(
         func=rewards.base_height_l2_fix,
@@ -540,11 +541,12 @@ class TeacherRewardsCfg:
         },
     )
     joint_torques_l2 = RewTerm(
-        func=rewards.joint_torques_l2, 
-        weight=-6.0e-07
+        func=rewards.joint_torque_l2,
+        weight=-6.0e-07,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
     joint_vel_l2 = RewTerm(
-        func=rewards.joint_vel_l2, weight=-8.0e-5
+        func=rewards.joint_vel_l2, weight=-5.0e-6
     )
     joint_power_distribution = RewTerm(
         func=rewards.joint_power_distribution,
@@ -552,24 +554,24 @@ class TeacherRewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint")},
     )
     joint_acc_l2 = RewTerm(
-        func=rewards.joint_acc_l2, weight=-1.0e-8
+        func=rewards.joint_acc_l2, weight=-3.0e-9
     )
     dof_error_l2 = RewTerm(
-        func=rewards.dof_error_l2, weight=-0.005,
+        func=rewards.dof_error_l2, weight=-5.0e-3,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
     hip_pos_l2 = RewTerm(
         func=rewards.hip_pos_l2,
-        weight=-0.005,
+        weight=-5.0e-3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint")},
     )
     action_rate_l2 = RewTerm(
         func=rewards.action_rate_l2,
-        weight=-0.0005
+        weight=-2.0e-5
     )
     action_smoothness_l2 = RewTerm(
         func=rewards.action_smoothness_l2, 
-        weight=-0.0005
+        weight=-1.0e-4
     )
     lin_vel_z_l2 = RewTerm(
         func=rewards.lin_vel_z_l2, 
@@ -581,34 +583,44 @@ class TeacherRewardsCfg:
     )
     feet_air_time = RewTerm(
         func=rewards.feet_air_time,
-        weight=1.0,
+        weight=1.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
-            "threshold": 0.35,
+            "threshold": 0.15,
         },
     )
     feet_slide = RewTerm(
         func=rewards.feet_slide,
-        weight=-0.05,
+        weight=-0.01,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-            "asset_cfg": SceneEntityCfg("robot"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
         },
     )
     load_sharing = RewTerm(
         func=rewards.load_sharing,
-        weight=0.0,
+        weight=1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")},
     )
     undesired_contacts = RewTerm(
         func=rewards.undesired_contacts,
-        weight=-5.0,
+        weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=[".*_thigh", ".*_calf"]
             ),
             "threshold": 1.0,
+        },
+    )
+    foot_clearance = RewTerm(
+        func=rewards.foot_clearance,
+        weight=0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "command_name": "base_velocity",
+            "target_height": 0.06,
         },
     )
 
@@ -660,19 +672,6 @@ class EventCfg:
     - 速度扰动：push_robot_vel
     - 力矩扰动：push_robot_torque
     """
-
-    def __post_init__(self):
-        """在初始化后处理配置，移除不应该传递给 __call__ 的参数。"""
-        # restitution_range 在 randomize_rigid_body_material 的 __init__ 中使用，
-        # 但不应该作为 __call__ 的参数传递
-        if hasattr(self, "physics_material") and self.physics_material is not None:
-            if (
-                hasattr(self.physics_material, "params")
-                and "restitution_range" in self.physics_material.params
-            ):
-                # 保存 restitution_range 的值，但不在 params 中传递
-                # 它会在 __init__ 时从 params 读取
-                pass  # 保持原样，因为事件管理器会在创建实例前检查
 
     # ========== 一、机身/动力学（reset 时） ==========
     # 机身质量随机化（对 base_link 质量做加性随机）
@@ -804,14 +803,24 @@ class EventCfg:
 class CurriculumCfg:
     # Stage-1 (flat locomotion): keep terrain difficulty fixed and only
     # ramp command thresholds as the single curriculum source.
-    terrain_levels = None
+    terrain_levels = CurrTerm(
+        func=curriculums.terrain_levels_vel,
+        params={
+            "move_up_ratio": GalileoDefaults.curriculum.terrain_move_up_ratio,
+            "move_down_ratio": GalileoDefaults.curriculum.terrain_move_down_ratio,
+        },
+    )
     lin_vel_x_command_threshold = CurrTerm(
         func=curriculums.lin_vel_x_command_threshold,
-        params={"episodes_per_level": GalileoDefaults.curriculum.episodes_per_level},
+        params={
+            "episodes_per_level": GalileoDefaults.curriculum.episodes_per_level,
+        },
     )
     ang_vel_z_command_threshold = CurrTerm(
         func=curriculums.ang_vel_z_command_threshold,
-        params={"episodes_per_level": GalileoDefaults.curriculum.episodes_per_level},
+        params={
+            "episodes_per_level": GalileoDefaults.curriculum.episodes_per_level,
+        },
     )
 
 

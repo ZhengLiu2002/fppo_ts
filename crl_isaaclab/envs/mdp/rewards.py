@@ -86,32 +86,20 @@ def feet_slide(
     norm of the linear velocity of the feet multiplied by a binary contact sensor. This ensures that the
     agent is penalized only when the feet are in contact with the ground.
     """
-    # Penalize feet sliding
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    # Check dimensions. contacts is (num_envs, num_feet)
     contacts = (
         contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
         .norm(dim=-1)
         .max(dim=1)[0]
         > 1.0
     )
-    asset = env.scene[asset_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
 
-    # Check dimensions. body_vel is (num_envs, num_bodies, 2).
-    # We need to slice asset.data.body_lin_vel_w correctly corresponding to the feet body ids.
-    # Note: asset_cfg used here may default to all bodies if not specified,
-    # but for this calculation we specifically need the feet velocities.
-    # So we should probably use the same body_ids as the sensor_cfg if not explicitly provided in asset_cfg.
+    foot_body_ids = asset_cfg.body_ids
+    if foot_body_ids is None or (isinstance(foot_body_ids, (list, tuple)) and len(foot_body_ids) == 0):
+        foot_body_ids = sensor_cfg.body_ids
 
-    # However, asset_cfg in the config is just SceneEntityCfg("robot"), which implies all bodies or default.
-    # The error message "The size of tensor a (19) must match the size of tensor b (4)" suggests:
-    # 'a' is body_vel (19 bodies in robot?)
-    # 'b' is contacts (4 feet)
-
-    # We must ensure we select the feet bodies from the robot asset.
-    # We can reuse sensor_cfg.body_ids because that selector was used to get the contact forces for the feet.
-
-    body_vel = asset.data.body_lin_vel_w[:, sensor_cfg.body_ids, :2]
+    body_vel = asset.data.body_lin_vel_w[:, foot_body_ids, :2]
     reward = torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
     return reward
 
@@ -419,35 +407,29 @@ def joint_torque_l2(
     return penalty * scale
 
 
-def joint_torques_l2(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """Penalize joint torque using L2 norm squared (alias for joint_torque_l2)."""
-    return joint_torque_l2(env, asset_cfg=asset_cfg)
-
-
-def amp_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Reward AMP."""
-    # extract the used quantities (to enable type-hinting)
-    reward = torch.clamp(1 - (1 / 4) * torch.square(env.amp_out - 1), min=0)
-    return reward.squeeze()
-
-
 def action_smoothness_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Reward action smoothness."""
     actions = getattr(env, "actions_history", None)
     if actions is not None:
-        diff = torch.square(
-            actions.get_data_vec([0]) - 2 * actions.get_data_vec([1]) + actions.get_data_vec([2])
-        )
-        return torch.sum(diff, dim=1)
+        diff2 = actions.get_data_vec([0]) - 2 * actions.get_data_vec([1]) + actions.get_data_vec([2])
+        diff2 = torch.nan_to_num(diff2, nan=0.0, posinf=0.0, neginf=0.0)
+        diff = torch.square(diff2)
+        norm_sq = torch.sum(diff, dim=1)
+        norm_sq = torch.nan_to_num(norm_sq, nan=0.0, posinf=1.0e6, neginf=1.0e6)
+        norm_sq = torch.clamp(norm_sq, max=1.0e6)
+        return norm_sq
     if not hasattr(env, "action_manager"):
         return torch.zeros(env.num_envs, device=env.device)
     action = env.action_manager.action
     prev_action = env.action_manager.prev_action
     prev_prev = getattr(env, "_prev_prev_action", prev_action)
     diff2 = action - 2 * prev_action + prev_prev
-    return torch.sum(torch.square(diff2), dim=1)
+    diff2 = torch.nan_to_num(diff2, nan=0.0, posinf=0.0, neginf=0.0)
+    diff = torch.square(diff2)
+    norm_sq = torch.sum(diff, dim=1)
+    norm_sq = torch.nan_to_num(norm_sq, nan=0.0, posinf=1.0e6, neginf=1.0e6)
+    norm_sq = torch.clamp(norm_sq, max=1.0e6)
+    return norm_sq
 
 
 def action_smoothness_penalty(
@@ -637,9 +619,13 @@ def joint_pos_l2(
 
 def action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Penalize changes in actions using L2 squared kernel."""
-    return torch.sum(
-        torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1
-    )
+    diff = env.action_manager.action - env.action_manager.prev_action
+    diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+    diff_sq = torch.square(diff)
+    norm_sq = torch.sum(diff_sq, dim=1)
+    norm_sq = torch.nan_to_num(norm_sq, nan=0.0, posinf=1.0e6, neginf=1.0e6)
+    norm_sq = torch.clamp(norm_sq, max=1.0e6)
+    return norm_sq
 
 
 def action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -717,3 +703,44 @@ def dof_error_l2(
         return torch.zeros(env.scene.num_envs, device=env.device)
     diff = asset.data.joint_pos[:, joint_ids] - asset.data.default_joint_pos[:, joint_ids]
     return torch.sum(torch.square(diff), dim=1)
+
+
+def foot_clearance(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    target_height: float = 0.06,
+    low_speed_threshold: float = 0.4,
+    tanh_mult: float = 5.0,
+) -> torch.Tensor:
+    """Reward feet for reaching a target clearance height during swing phase.
+
+    Uses a tanh-based shaping so the reward saturates near 1 when foot height
+    is at or above target_height, providing a smooth gradient for learning to
+    lift feet. Only active during the swing phase (foot not in contact) and
+    scaled down at low command speeds to avoid forcing steps while standing.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        .norm(dim=-1)
+        .max(dim=1)[0]
+        > 1.0
+    )
+    swing_mask = ~contacts  # (num_envs, num_feet)
+
+    foot_z = asset.data.body_pos_w[:, sensor_cfg.body_ids, 2]  # (num_envs, num_feet)
+
+    clearance_reward = torch.tanh(tanh_mult * (foot_z - target_height) / max(target_height, 1e-4))
+    clearance_reward = swing_mask.float() * clearance_reward
+
+    reward = torch.mean(clearance_reward, dim=1)
+
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    speed_scale = torch.clamp(cmd_norm / max(low_speed_threshold, 1e-6), min=0.0, max=1.0)
+    reward *= speed_scale
+
+    return reward
