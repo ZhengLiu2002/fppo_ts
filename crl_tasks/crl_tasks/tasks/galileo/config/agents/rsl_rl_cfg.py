@@ -66,6 +66,7 @@ class CRLRslRlPpoActorCriticCfg(RslRlPpoActorCriticCfg):
 class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "FPPO"
     dagger_update_freq: int = 1
+    # Legacy typo retained for backward compatibility with old checkpoints/configs.
     priv_reg_coef_schedual: list[float] = [0, 0.1, 2000, 3000]
 
     # FPPO/CMDP extensions
@@ -76,6 +77,7 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     cost_limit: float = 0.0
     delta_safe: float | None = 0.01
     backtrack_coeff: float = 0.5
+    max_corrections: int = 10
     max_backtracks: int = 10
     projection_eps: float = 1e-8
     epsilon_safe: float = 0.0
@@ -84,7 +86,7 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     confidence_level: float = 0.05
     softproj_max_iters: int = 40
     softproj_tol: float = 1e-6
-    constraint_limits: list[float] | None = None
+    constraint_limits: list[float] | dict[str, float] | None = None
     use_clipped_surrogate: bool = True
     normalize_cost_advantage: bool = False
     constraint_normalization: bool = True
@@ -99,6 +101,7 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     use_preconditioner: bool = True
     preconditioner_beta: float = 0.999
     preconditioner_eps: float = 1e-8
+    # Legacy compatibility knobs. Current FPPO path keeps them for config compatibility.
     feasible_first: bool = True
     feasible_first_coef: float = 1.0
     feasible_cost_margin: float = 1e-3
@@ -113,6 +116,8 @@ class CRLRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     step_size_max: float = 2e-3
     target_accept_rate: float = 0.75
     step_size_cost_margin: float = 0.2
+    effective_step_ratio_target: float = 0.25
+    effective_step_ratio_floor: float = 0.08
     k_decay: float = 1.0
     k_min: float = 0.0
     k_violation_threshold: float = 0.02

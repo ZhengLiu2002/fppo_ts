@@ -16,7 +16,6 @@ from crl_isaaclab.envs.mdp.crl_actions import DelayedJointPositionActionCfg
 from isaaclab.envs.mdp.events import (
     apply_external_force_torque,
     randomize_rigid_body_mass,
-    reset_joints_by_scale,
 )
 from isaaclab.managers import (
     CurriculumTermCfg as CurrTerm,
@@ -33,14 +32,50 @@ from isaaclab.utils import configclass
 from .defaults import GalileoDefaults
 
 
-LEG_JOINT_CFG = SceneEntityCfg(
-    "robot",
-    joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-    preserve_order=True,
-)
+LEG_JOINT_NAMES = [
+    "FL_hip_joint",
+    "FR_hip_joint",
+    "RL_hip_joint",
+    "RR_hip_joint",
+    "FL_thigh_joint",
+    "FR_thigh_joint",
+    "RL_thigh_joint",
+    "RR_thigh_joint",
+    "FL_calf_joint",
+    "FR_calf_joint",
+    "RL_calf_joint",
+    "RR_calf_joint",
+]
 
-FOOT_BODY_NAMES = [".*_foot"]
+LEG_JOINT_CFG = SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES, preserve_order=True)
+
+FOOT_BODY_NAMES = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 BASE_BODY_NAMES = ["base_link"]
+
+# Joint-position envelope aligned to the target diagonal gait.
+# The "core" windows encode the minimum practical gait motion, and then we
+# add a small extra margin (5 deg) to avoid over-constraining transitions.
+GAIT_JOINT_POS_WINDOW_MARGIN_RAD = 5.0 * (3.141592653589793 / 180.0)
+_GAIT_CORE_JOINT_POS_WINDOW_RAD = {
+    # Hip sign is mirrored between left and right legs.
+    "FL_hip_joint": (-0.20, 0.20),
+    "FR_hip_joint": (-0.20, 0.20),
+    "RL_hip_joint": (-0.20, 0.20),
+    "RR_hip_joint": (-0.20, 0.20),
+    # Thigh/calf keep the same flexion direction across all four legs.
+    "FL_thigh_joint": (0.30, 1.20),
+    "FR_thigh_joint": (0.30, 1.20),
+    "RL_thigh_joint": (0.30, 1.20),
+    "RR_thigh_joint": (0.30, 1.20),
+    "FL_calf_joint": (-2.00, -1.00),
+    "FR_calf_joint": (-2.00, -1.00),
+    "RL_calf_joint": (-2.00, -1.00),
+    "RR_calf_joint": (-2.00, -1.00),
+}
+GAIT_JOINT_POS_WINDOW_RAD = {
+    joint_name: (bounds[0] - GAIT_JOINT_POS_WINDOW_MARGIN_RAD, bounds[1] + GAIT_JOINT_POS_WINDOW_MARGIN_RAD)
+    for joint_name, bounds in _GAIT_CORE_JOINT_POS_WINDOW_RAD.items()
+}
 
 
 @configclass
@@ -89,86 +124,59 @@ class CommandsCfg:
 
 
 @configclass
+class _PrivilegedObsGroupCfg(ObsGroup):
+    """Shared privileged observation terms for teacher and critic views."""
+
+    base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+    actions = ObsTerm(func=mdp.last_action)
+    velocity_commands = ObsTerm(
+        func=mdp.generated_commands,
+        params={"command_name": "base_velocity"},
+    )
+    height_scan = ObsTerm(
+        func=mdp.height_scan,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5},
+    )
+    base_com = ObsTerm(
+        func=crl_obs.base_com,
+        params={
+            "body_name": "base_link",
+            "normalize": True,
+            "com_range": GalileoDefaults.priv_obs_norm.base_com_range,
+        },
+    )
+    base_mass = ObsTerm(
+        func=crl_obs.base_mass,
+        params={
+            "body_name": "base_link",
+            "normalize": True,
+            "mass_delta_range": GalileoDefaults.priv_obs_norm.base_mass_delta_range,
+        },
+    )
+    ground_friction = ObsTerm(
+        func=crl_obs.ground_friction,
+        params={
+            "normalize": True,
+            "friction_range": GalileoDefaults.priv_obs_norm.ground_friction_range,
+        },
+    )
+
+
+@configclass
 class TeacherObservationsCfg:
-    """FPPO 风格观测：base/imu/joint/command。"""
+    """FPPO 风格观测：teacher 的 actor/critic 使用同一套特权观测。"""
 
     @configclass
-    class PolicyCfg(ObsGroup):
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        actions = ObsTerm(func=mdp.last_action)
-        velocity_commands = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "base_velocity"}
-        )
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5},
-        )
-        base_com = ObsTerm(
-            func=crl_obs.base_com,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "com_range": GalileoDefaults.priv_obs_norm.base_com_range,
-            },
-        )
-        base_mass = ObsTerm(
-            func=crl_obs.base_mass,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "mass_delta_range": GalileoDefaults.priv_obs_norm.base_mass_delta_range,
-            },
-        )
-        ground_friction = ObsTerm(
-            func=crl_obs.ground_friction,
-            params={
-                "normalize": True,
-                "friction_range": GalileoDefaults.priv_obs_norm.ground_friction_range,
-            },
-        )
+    class PolicyCfg(_PrivilegedObsGroupCfg):
+        pass
 
     @configclass
-    class CriticCfg(ObsGroup):
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        actions = ObsTerm(func=mdp.last_action)
-        velocity_commands = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "base_velocity"}
-        )
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5},
-        )
-        base_com = ObsTerm(
-            func=crl_obs.base_com,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "com_range": GalileoDefaults.priv_obs_norm.base_com_range,
-            },
-        )
-        base_mass = ObsTerm(
-            func=crl_obs.base_mass,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "mass_delta_range": GalileoDefaults.priv_obs_norm.base_mass_delta_range,
-            },
-        )
-        ground_friction = ObsTerm(
-            func=crl_obs.ground_friction,
-            params={
-                "normalize": True,
-                "friction_range": GalileoDefaults.priv_obs_norm.ground_friction_range,
-            },
-        )
+    class CriticCfg(_PrivilegedObsGroupCfg):
+        pass
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -192,43 +200,8 @@ class StudentObservationsCfg:
         )
 
     @configclass
-    class CriticCfg(ObsGroup):
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        actions = ObsTerm(func=mdp.last_action)
-        velocity_commands = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "base_velocity"}
-        )
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5},
-        )
-        base_com = ObsTerm(
-            func=crl_obs.base_com,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "com_range": GalileoDefaults.priv_obs_norm.base_com_range,
-            },
-        )
-        base_mass = ObsTerm(
-            func=crl_obs.base_mass,
-            params={
-                "body_name": "base_link",
-                "normalize": True,
-                "mass_delta_range": GalileoDefaults.priv_obs_norm.base_mass_delta_range,
-            },
-        )
-        ground_friction = ObsTerm(
-            func=crl_obs.ground_friction,
-            params={
-                "normalize": True,
-                "friction_range": GalileoDefaults.priv_obs_norm.ground_friction_range,
-            },
-        )
+    class CriticCfg(_PrivilegedObsGroupCfg):
+        pass
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -241,18 +214,33 @@ class TeacherCostsCfg:
     prob_joint_pos = CostTerm(
         func=mdp_constraints.joint_pos_prob_constraint,
         weight=1.0,
-        # Keep slight strictness, but avoid over-triggering during gait transitions.
-        params={"margin": -0.03, "limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        # Use a gait-aligned joint envelope (+5 deg margin) to support contact-phase consistency.
+        params={
+            "margin": 0.0,
+            "joint_pos_window": GAIT_JOINT_POS_WINDOW_RAD,
+            "limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
     prob_joint_vel = CostTerm(
         func=mdp_constraints.joint_vel_prob_constraint,
         weight=1.0,
-        params={"limit": 15.0, "cost_limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        params={
+            "limit": 15.0,
+            "soft_ratio": 0.8,
+            "cost_limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
     prob_joint_torque = CostTerm(
         func=mdp_constraints.joint_torque_prob_constraint,
         weight=1.0,
-        params={"limit": 80.0, "cost_limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        params={
+            "limit": 80.0,
+            "soft_ratio": 0.8,
+            "cost_limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
     prob_body_contact = CostTerm(
         func=mdp_constraints.body_contact_prob_constraint,
@@ -267,17 +255,17 @@ class TeacherCostsCfg:
     )
     prob_com_frame = CostTerm(
         func=mdp_constraints.com_frame_prob_constraint,
-        weight=0.35,
+        weight=0.45,
         params={
             # Keep base height/orientation as hard-ish feasibility constraints at convergence.
-            "height_range": (0.4, 0.43),
-            "max_angle_rad": 0.60,
+            "height_range": (0.41, 0.44),
+            "max_angle_rad": 0.55,
             "cost_limit": 1.0,
             # Start from a tolerant physical region (not ground-hugging), then tighten.
-            "height_range_start": (0.18, 0.56),
-            "height_range_end": (0.39, 0.43),
+            "height_range_start": (0.22, 0.56),
+            "height_range_end": (0.41, 0.44),
             "max_angle_rad_start": 0.85,
-            "max_angle_rad_end": 0.60,
+            "max_angle_rad_end": 0.55,
             "schedule_start_step": GalileoDefaults.curriculum.command_warmup_steps,
             "schedule_end_step": (
                 GalileoDefaults.curriculum.command_warmup_steps
@@ -291,14 +279,14 @@ class TeacherCostsCfg:
     )
     prob_gait_pattern = CostTerm(
         func=mdp_constraints.gait_pattern_prob_constraint,
-        weight=0.35,
+        weight=0.65,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "foot_body_names": FOOT_BODY_NAMES,
             "gait_frequency": 1.5,
             "phase_offsets": [0.0, 0.5, 0.5, 0.0],
             "stance_ratio": 0.5,
-            "contact_threshold": 5.0,
+            "contact_threshold": 8.0,
             "command_name": "base_velocity",
             "min_frequency": None,
             "max_frequency": None,
@@ -306,17 +294,18 @@ class TeacherCostsCfg:
             "frequency_scale": 0.0,
             "min_command_speed": 0.10,
             "min_base_speed": None,
+            "max_abs_yaw_cmd": 0.10,
             "asset_cfg": SceneEntityCfg("robot"),
             "limit": 1.0,
             # Start from a tolerant gait consistency target and tighten over time.
             "gait_frequency_start": 1.0,
-            "gait_frequency_end": 1.5,
+            "gait_frequency_end": 1.8,
             "stance_ratio_start": 0.62,
             "stance_ratio_end": 0.5,
             "phase_offset_scale_start": 0.60,
             "phase_offset_scale_end": 1.0,
             "phase_tolerance_start": 0.18,
-            "phase_tolerance_end": 0.05,
+            "phase_tolerance_end": 0.02,
             "schedule_start_step": GalileoDefaults.curriculum.command_warmup_steps,
             "schedule_end_step": (
                 GalileoDefaults.curriculum.command_warmup_steps
@@ -327,7 +316,11 @@ class TeacherCostsCfg:
     orthogonal_velocity = CostTerm(
         func=mdp_constraints.orthogonal_velocity_constraint,
         weight=0.10,
-        params={"asset_cfg": SceneEntityCfg("robot"), "limit": 3.0},
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "command_name": "base_velocity",
+            "limit": 3.0,
+        },
     )
     contact_velocity = CostTerm(
         func=mdp_constraints.contact_velocity_constraint,
@@ -359,6 +352,7 @@ class TeacherCostsCfg:
             "command_name": "base_velocity",
             "min_command_speed": 0.10,
             "min_base_speed": None,
+            "max_abs_yaw_cmd": 0.10,
         },
     )
     foot_height_limit = CostTerm(
@@ -381,8 +375,9 @@ class TeacherCostsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             "include_actions": True,
             "command_name": "base_velocity",
-            "min_command_speed": None,
+            "min_command_speed": 0.10,
             "min_base_speed": None,
+            "max_abs_yaw_cmd": 0.10,
             "limit": 5.0,
         },
     )
@@ -405,17 +400,32 @@ class StudentCostsCfg:
     prob_joint_pos = CostTerm(
         func=mdp_constraints.joint_pos_prob_constraint,
         weight=1.0,
-        params={"margin": -0.05, "limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        params={
+            "margin": 0.0,
+            "joint_pos_window": GAIT_JOINT_POS_WINDOW_RAD,
+            "limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
     prob_joint_vel = CostTerm(
         func=mdp_constraints.joint_vel_prob_constraint,
         weight=1.0,
-        params={"limit": 15.0, "cost_limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        params={
+            "limit": 15.0,
+            "soft_ratio": 0.8,
+            "cost_limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
     prob_joint_torque = CostTerm(
         func=mdp_constraints.joint_torque_prob_constraint,
         weight=1.0,
-        params={"limit": 80.0, "cost_limit": 1.0, "asset_cfg": LEG_JOINT_CFG},
+        params={
+            "limit": 80.0,
+            "soft_ratio": 0.8,
+            "cost_limit": 1.0,
+            "asset_cfg": LEG_JOINT_CFG,
+        },
     )
 
 
@@ -567,11 +577,11 @@ class TeacherRewardsCfg:
     )
     track_ang_vel_z_exp = RewTerm(
         func=rewards.track_ang_vel_z_exp,
-        weight=3.5,
+        weight=4.5,
         params={
             "command_name": "base_velocity",
-            "std": 0.22,
-            "min_command_speed": 0.08,
+            "std": 0.25,
+            "min_command_speed": 0.05,
         },
     )
     flat_orientation_l2 = RewTerm(
@@ -590,7 +600,7 @@ class TeacherRewardsCfg:
     )
     joint_torques_l2 = RewTerm(
         func=rewards.joint_torque_l2,
-        weight=0.0,  # old: -6.0e-7
+        weight=-6.0e-7,  # old: -6.0e-7
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
     joint_vel_l2 = RewTerm(
@@ -598,7 +608,7 @@ class TeacherRewardsCfg:
     )
     joint_power_distribution = RewTerm(
         func=rewards.joint_power_distribution,
-        weight=0.0,  # old: -1.0e-6
+        weight=-1.0e-6,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint")},
     )
     joint_acc_l2 = RewTerm(
@@ -617,11 +627,11 @@ class TeacherRewardsCfg:
     )
     action_rate_l2 = RewTerm(
         func=rewards.action_rate_l2,
-        weight=-3.0e-5
+        weight=0.0  # old: -6.0e-5
     )
     action_smoothness_l2 = RewTerm(
         func=rewards.action_smoothness_l2, 
-        weight=-2.0e-4
+        weight=-3.5e-4
     )
     lin_vel_z_l2 = RewTerm(
         func=rewards.lin_vel_z_l2, 
@@ -656,7 +666,7 @@ class TeacherRewardsCfg:
     )
     gait_contact_symmetry = RewTerm(
         func=rewards.gait_contact_symmetry,
-        weight=0.0,  # old: 0.0
+        weight=0.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "left_foot_names": ["FL_foot", "RL_foot"],
@@ -670,7 +680,7 @@ class TeacherRewardsCfg:
     )
     fore_hind_contact_balance = RewTerm(
         func=rewards.gait_contact_symmetry,
-        weight=0.0,  # old: 0.0
+        weight=0.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "left_foot_names": ["FL_foot", "FR_foot"],
@@ -931,7 +941,8 @@ class ActionsCfg:
 
     joint_pos = DelayedJointPositionActionCfg(
         asset_name="robot",
-        joint_names=[".*"],
+        joint_names=LEG_JOINT_NAMES,
+        preserve_order=True,
         scale=0.25,
         use_default_offset=True,
         action_delay_steps=[1, 1],

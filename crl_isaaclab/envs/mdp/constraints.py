@@ -95,6 +95,7 @@ def _command_gate(
     asset_cfg: SceneEntityCfg,
     device: torch.device,
     dtype: torch.dtype,
+    max_abs_yaw_cmd: float | None = None,
 ) -> torch.Tensor | None:
     gate = None
     if command_name is not None and hasattr(env, "command_manager"):
@@ -105,6 +106,14 @@ def _command_gate(
                 gate = cmd_speed >= min_command_speed
             else:
                 gate = torch.ones_like(cmd_speed, dtype=torch.bool)
+            if max_abs_yaw_cmd is not None:
+                yaw_cmd = (
+                    torch.abs(commands[:, 2])
+                    if commands.shape[1] > 2
+                    else torch.zeros_like(cmd_speed)
+                )
+                yaw_gate = yaw_cmd <= max_abs_yaw_cmd
+                gate = yaw_gate if gate is None else (gate & yaw_gate)
     if min_base_speed is not None:
         asset: Articulation = env.scene[asset_cfg.name]
         base_speed = torch.linalg.norm(asset.data.root_lin_vel_w[:, :2], dim=1)
@@ -212,6 +221,28 @@ def _resolve_base_speed(
     return lin + yaw
 
 
+def _resolve_episode_phase_time(
+    env: ManagerBasedRLEnv,
+    dt: float,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-environment elapsed time within the current episode."""
+    if dt <= 0.0:
+        return torch.zeros(env.num_envs, device=device, dtype=dtype)
+
+    episode_len = getattr(env, "episode_length_buf", None)
+    if episode_len is not None and torch.is_tensor(episode_len):
+        # episode_length_buf is incremented before cost computation; subtract one step
+        # so each environment starts its phase from t=0 after reset.
+        steps = episode_len.to(device=device, dtype=dtype) - 1.0
+        steps = torch.clamp(steps, min=0.0)
+        return steps * dt
+
+    global_step = float(getattr(env, "_sim_step_counter", 0))
+    return torch.full((env.num_envs,), global_step * dt, device=device, dtype=dtype)
+
+
 def _terrain_height_at_points(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -261,6 +292,7 @@ def _foot_heights_relative(
 def constraint_joint_pos(
     env: ManagerBasedRLEnv,
     margin: float = 0.3,
+    joint_pos_window: dict[str, tuple[float, float]] | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Fraction of joints violating soft position limits."""
@@ -312,8 +344,62 @@ def constraint_joint_pos(
         return _zeros_like_env(env, dtype=joint_pos.dtype)
 
     margin_t = torch.as_tensor(margin, device=joint_pos.device, dtype=joint_pos.dtype)
-    lower = limits[..., 0] - margin_t
-    upper = limits[..., 1] + margin_t
+    soft_lower = limits[..., 0] - margin_t
+    soft_upper = limits[..., 1] + margin_t
+    lower = soft_lower.clone()
+    upper = soft_upper.clone()
+
+    if joint_pos_window:
+        all_joint_names = getattr(asset.data, "joint_names", None)
+        if all_joint_names is None:
+            _warn_once(
+                env,
+                "_warn_missing_joint_names_for_window",
+                "joint_pos_window provided but joint names are unavailable; using soft limits only.",
+            )
+        else:
+            if isinstance(joint_ids, slice):
+                selected_joint_names = list(all_joint_names)
+            else:
+                selected_joint_names = [all_joint_names[idx] for idx in joint_ids]
+
+            has_reversed_bounds = False
+            for local_idx, joint_name in enumerate(selected_joint_names):
+                bounds = joint_pos_window.get(joint_name)
+                if bounds is None:
+                    continue
+                raw_low, raw_high = float(bounds[0]), float(bounds[1])
+                bound_low = min(raw_low, raw_high)
+                bound_high = max(raw_low, raw_high)
+                if raw_low > raw_high:
+                    has_reversed_bounds = True
+
+                bound_low_t = torch.as_tensor(
+                    bound_low, device=joint_pos.device, dtype=joint_pos.dtype
+                )
+                bound_high_t = torch.as_tensor(
+                    bound_high, device=joint_pos.device, dtype=joint_pos.dtype
+                )
+                lower[:, local_idx] = torch.maximum(lower[:, local_idx], bound_low_t)
+                upper[:, local_idx] = torch.minimum(upper[:, local_idx], bound_high_t)
+
+            if has_reversed_bounds:
+                _warn_once(
+                    env,
+                    "_warn_joint_pos_window_order",
+                    "Detected reversed [upper, lower] entries in joint_pos_window; auto-corrected.",
+                )
+
+            invalid_window = lower > upper
+            if invalid_window.any():
+                _warn_once(
+                    env,
+                    "_warn_joint_pos_window_conflict",
+                    "joint_pos_window conflicts with soft limits for some joints; falling back to soft limits on those joints.",
+                )
+                lower = torch.where(invalid_window, soft_lower, lower)
+                upper = torch.where(invalid_window, soft_upper, upper)
+
     violation = (joint_pos < lower) | (joint_pos > upper)
     return violation.float().mean(dim=1)
 
@@ -321,30 +407,48 @@ def constraint_joint_pos(
 def joint_pos_prob_constraint(
     env: ManagerBasedRLEnv,
     margin: float = 0.0,
+    joint_pos_window: dict[str, tuple[float, float]] | None = None,
     limit: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    cost = constraint_joint_pos(env, margin=margin, asset_cfg=asset_cfg)
+    cost = constraint_joint_pos(
+        env,
+        margin=margin,
+        joint_pos_window=joint_pos_window,
+        asset_cfg=asset_cfg,
+    )
     return _normalize_cost(cost, limit)
 
 
 def joint_vel_prob_constraint(
     env: ManagerBasedRLEnv,
     limit: float = 50.0,
+    soft_ratio: float = 1.0,
     cost_limit: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    cost = constraint_joint_vel(env, limit=limit, asset_cfg=asset_cfg)
+    cost = constraint_joint_vel(
+        env,
+        limit=limit,
+        soft_ratio=soft_ratio,
+        asset_cfg=asset_cfg,
+    )
     return _normalize_cost(cost, cost_limit)
 
 
 def joint_torque_prob_constraint(
     env: ManagerBasedRLEnv,
     limit: float = 100.0,
+    soft_ratio: float = 1.0,
     cost_limit: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    cost = constraint_joint_torque(env, limit=limit, asset_cfg=asset_cfg)
+    cost = constraint_joint_torque(
+        env,
+        limit=limit,
+        soft_ratio=soft_ratio,
+        asset_cfg=asset_cfg,
+    )
     return _normalize_cost(cost, cost_limit)
 
 
@@ -448,6 +552,7 @@ def gait_pattern_prob_constraint(
     frequency_scale: float = 0.0,
     min_command_speed: float | None = None,
     min_base_speed: float | None = None,
+    max_abs_yaw_cmd: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     limit: float | None = None,
     limit_relax_epsilon: float | None = None,
@@ -516,7 +621,12 @@ def gait_pattern_prob_constraint(
         dtype=contact_sensor.data.net_forces_w.dtype,
         device=contact_sensor.data.net_forces_w.device,
     )
-    t = getattr(env, "_sim_step_counter", 0) * dt
+    t = _resolve_episode_phase_time(
+        env,
+        dt=dt,
+        dtype=contact_sensor.data.net_forces_w.dtype,
+        device=contact_sensor.data.net_forces_w.device,
+    ).unsqueeze(-1)
     phase = (t * freq.unsqueeze(-1) + phase_offsets) % 1.0
     stance = phase < stance_ratio_curr
 
@@ -550,6 +660,7 @@ def gait_pattern_prob_constraint(
         asset_cfg=asset_cfg,
         device=cost.device,
         dtype=cost.dtype,
+        max_abs_yaw_cmd=max_abs_yaw_cmd,
     )
     if gate is not None:
         cost = cost * gate
@@ -562,12 +673,26 @@ def gait_pattern_prob_constraint(
 
 def orthogonal_velocity_constraint(
     env: ManagerBasedRLEnv,
+    command_name: str | None = None,
     limit: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    vel = asset.data.root_lin_vel_w
-    cost = torch.abs(vel[:, 1])
+    vel_b = getattr(asset.data, "root_lin_vel_b", None)
+    if vel_b is not None:
+        lateral_vel = vel_b[:, 1]
+    else:
+        lateral_vel = asset.data.root_lin_vel_w[:, 1]
+
+    target_lateral = torch.zeros_like(lateral_vel)
+    if command_name is not None and hasattr(env, "command_manager"):
+        command = env.command_manager.get_command(command_name)
+        if command is not None and command.shape[1] > 1:
+            target_lateral = command[:, 1].to(
+                device=lateral_vel.device, dtype=lateral_vel.dtype
+            )
+
+    cost = torch.abs(lateral_vel - target_lateral)
     return _normalize_cost(cost, limit)
 
 
@@ -608,6 +733,7 @@ def foot_clearance_constraint(
     command_name: str | None = None,
     min_command_speed: float | None = None,
     min_base_speed: float | None = None,
+    max_abs_yaw_cmd: float | None = None,
 ) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     foot_ids, _ = contact_sensor.find_bodies(foot_body_names, preserve_order=True)
@@ -638,7 +764,12 @@ def foot_clearance_constraint(
         dtype=foot_heights.dtype,
         device=foot_heights.device,
     )
-    t = getattr(env, "_sim_step_counter", 0) * dt
+    t = _resolve_episode_phase_time(
+        env,
+        dt=dt,
+        dtype=foot_heights.dtype,
+        device=foot_heights.device,
+    ).unsqueeze(-1)
     phase = (t * freq.unsqueeze(-1) + phase_offsets) % 1.0
     swing = phase >= stance_ratio
     clearance = torch.clamp(min_height_t - foot_heights, min=0.0) * swing.float()
@@ -651,6 +782,7 @@ def foot_clearance_constraint(
         asset_cfg=asset_cfg,
         device=cost.device,
         dtype=cost.dtype,
+        max_abs_yaw_cmd=max_abs_yaw_cmd,
     )
     if gate is not None:
         cost = cost * gate
@@ -688,6 +820,7 @@ def symmetric_constraint(
     command_name: str | None = None,
     min_command_speed: float | None = None,
     min_base_speed: float | None = None,
+    max_abs_yaw_cmd: float | None = None,
     limit: float | None = None,
 ) -> torch.Tensor:
     """Average action symmetry constraint using L1 distance on mirrored joints."""
@@ -709,6 +842,7 @@ def symmetric_constraint(
         asset_cfg=asset_cfg,
         device=sym.device,
         dtype=sym.dtype,
+        max_abs_yaw_cmd=max_abs_yaw_cmd,
     )
     if gate is not None:
         sym = sym * gate
@@ -738,9 +872,15 @@ def base_contact_force_constraint(
 def constraint_joint_vel(
     env: ManagerBasedRLEnv,
     limit: float = 50.0,
+    soft_ratio: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Fraction of joints violating velocity limits."""
+    """Soft fraction of velocity-limit violations.
+
+    ``soft_ratio`` controls where penalties start:
+    - ``soft_ratio >= 1.0``: binary violation at ``|v| > limit`` (legacy behavior)
+    - ``0 < soft_ratio < 1.0``: linear ramp from ``soft_ratio * limit`` to ``limit``
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     joint_ids = _get_joint_slice(asset_cfg)
     joint_vel = getattr(asset.data, "joint_vel", None)
@@ -754,16 +894,31 @@ def constraint_joint_vel(
     if not isinstance(joint_ids, slice):
         joint_vel = joint_vel[:, joint_ids]
     limit_t = torch.as_tensor(limit, device=joint_vel.device, dtype=joint_vel.dtype)
-    violation = torch.abs(joint_vel) > limit_t
-    return violation.float().mean(dim=1)
+    abs_vel = torch.abs(joint_vel)
+    ratio = float(soft_ratio)
+    if ratio >= 1.0:
+        violation = abs_vel > limit_t
+        return violation.float().mean(dim=1)
+
+    ratio = min(max(ratio, 1.0e-6), 0.999999)
+    soft_start = limit_t * ratio
+    denom = torch.clamp(limit_t - soft_start, min=torch.finfo(joint_vel.dtype).eps)
+    violation = torch.clamp((abs_vel - soft_start) / denom, min=0.0, max=1.0)
+    return violation.mean(dim=1)
 
 
 def constraint_joint_torque(
     env: ManagerBasedRLEnv,
     limit: float = 100.0,
+    soft_ratio: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Fraction of joints violating torque limits."""
+    """Soft fraction of torque-limit violations.
+
+    ``soft_ratio`` controls where penalties start:
+    - ``soft_ratio >= 1.0``: binary violation at ``|tau| > limit`` (legacy behavior)
+    - ``0 < soft_ratio < 1.0``: linear ramp from ``soft_ratio * limit`` to ``limit``
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     joint_ids = _get_joint_slice(asset_cfg)
     torque = getattr(asset.data, "applied_torque", None)
@@ -777,8 +932,17 @@ def constraint_joint_torque(
     if not isinstance(joint_ids, slice):
         torque = torque[:, joint_ids]
     limit_t = torch.as_tensor(limit, device=torque.device, dtype=torque.dtype)
-    violation = torch.abs(torque) > limit_t
-    return violation.float().mean(dim=1)
+    abs_torque = torch.abs(torque)
+    ratio = float(soft_ratio)
+    if ratio >= 1.0:
+        violation = abs_torque > limit_t
+        return violation.float().mean(dim=1)
+
+    ratio = min(max(ratio, 1.0e-6), 0.999999)
+    soft_start = limit_t * ratio
+    denom = torch.clamp(limit_t - soft_start, min=torch.finfo(torque.dtype).eps)
+    violation = torch.clamp((abs_torque - soft_start) / denom, min=0.0, max=1.0)
+    return violation.mean(dim=1)
 
 
 def constraint_com_orientation(

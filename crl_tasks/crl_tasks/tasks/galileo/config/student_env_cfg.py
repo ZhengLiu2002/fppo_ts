@@ -35,7 +35,10 @@ class GalileoStudentSceneCfg(GalileoCRLSceneCfg):
 
 @configclass
 class GalileoStudentCRLEnvCfg(CRLManagerBasedRLEnvCfg):
-    scene: GalileoStudentSceneCfg = GalileoStudentSceneCfg(num_envs=1024, env_spacing=1.0)
+    scene: GalileoStudentSceneCfg = GalileoStudentSceneCfg(
+        num_envs=GalileoDefaults.env.student_num_envs,
+        env_spacing=1.0,
+    )
     observations: StudentObservationsCfg = StudentObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
@@ -51,7 +54,7 @@ class GalileoStudentCRLEnvCfg(CRLManagerBasedRLEnvCfg):
         self.decimation = GalileoDefaults.general.decimation
         self.episode_length_s = GalileoDefaults.general.episode_length_s
         self.sim.dt = GalileoDefaults.sim.dt
-        self.sim.render_interval = self.decimation
+        self.sim.render_interval = GalileoDefaults.general.render_interval
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
         self.sim.physx.gpu_found_lost_pairs_capacity = 10 * 1024 * 1024
@@ -74,7 +77,7 @@ class GalileoStudentCRLEnvCfg_EVAL(GalileoStudentCRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         # 评估/可视化：减少并行环境数量、放宽命令采样，开启调试可视化
-        self.scene.num_envs = 128
+        self.scene.num_envs = GalileoDefaults.env.student_eval_num_envs
         self.commands.base_velocity.debug_vis = True
         self.scene.terrain.max_init_terrain_level = None
         self.commands.base_velocity.resampling_time_range = (60.0, 60.0)
@@ -89,7 +92,7 @@ class GalileoStudentCRLEnvCfg_PLAY(GalileoStudentCRLEnvCfg_EVAL):
     def __post_init__(self):
         super().__post_init__()
         # 试玩模式：降低并行数、延长单回合时长，并切换为竞赛固定布局
-        self.scene.num_envs = 16
+        self.scene.num_envs = GalileoDefaults.env.student_play_num_envs
         self.episode_length_s = 60.0
         self.scene.terrain.terrain_generator.difficulty_range = (0.7, 1.0)
         self.scene.terrain.terrain_generator.curriculum = False

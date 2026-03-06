@@ -76,6 +76,25 @@ _RUNNER_ONLY_ALG_KEYS = {
     "constraint_cost_scale",
 }
 
+_KEY_CURVE_MIRROR_MAP = {
+    "Train/mean_reward": "Compare/Core/reward",
+    "Train/mean_episode_length": "Compare/Core/episode_length",
+    "Metrics/base_velocity/error_vel_xy": "Compare/Tracking/error_vel_xy",
+    "Metrics/base_velocity/error_vel_yaw": "Compare/Tracking/error_vel_yaw",
+    "Episode_Reward/track_lin_vel_xy_exp": "Compare/Tracking/track_lin_vel_xy",
+    "Episode_Reward/track_ang_vel_z_exp": "Compare/Tracking/track_ang_vel_z",
+    "Cost/mean_cost_return": "Compare/Cost/mean_cost_return",
+    "Cost/cost_limit_margin": "Compare/Cost/cost_limit_margin",
+    "Cost/cost_violation_rate": "Compare/Cost/cost_violation_rate",
+    "Episode_Cost/prob_gait_pattern": "Compare/Gait/prob_gait_pattern",
+    "Episode_Cost/symmetric": "Compare/Gait/symmetric",
+    "Episode_Cost/contact_velocity": "Compare/Gait/contact_velocity",
+    "Episode_Cost/prob_com_frame": "Compare/Stability/prob_com_frame",
+    "Episode_Cost/prob_joint_pos": "Compare/Cost/prob_joint_pos",
+    "Episode_Cost/prob_joint_vel": "Compare/Cost/prob_joint_vel",
+    "Episode_Cost/prob_joint_torque": "Compare/Cost/prob_joint_torque",
+}
+
 
 class OnPolicyRunnerWithExtractor(OnPolicyRunner):
     """纯算法训练 Runner，支持 PPO/FPPO/CPO/Distillation 等流程。"""
@@ -105,6 +124,16 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             return int(len(term_names))
         return None
 
+    @staticmethod
+    def _infer_cost_term_names(env: VecEnv) -> list[str] | None:
+        cost_manager = getattr(env.unwrapped, "cost_manager", None)
+        if cost_manager is None:
+            return None
+        term_names = getattr(cost_manager, "active_terms", None)
+        if isinstance(term_names, (list, tuple)) and len(term_names) > 0:
+            return sorted(str(name) for name in term_names)
+        return None
+
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -115,6 +144,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         self.device = device
         self.env = env
         self.mean_hist_latent_loss = 0.0
+        self._key_curve_mirror_map = dict(_KEY_CURVE_MIRROR_MAP)
         self._configure_multi_gpu()
         self._constraint_normalizer = None
         self._constraint_scale_by_gamma = bool(
@@ -128,6 +158,20 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             self._constraint_normalizer = ConstraintNormalizer.from_cfg(
                 self.alg_cfg_full, device=self.device
             )
+        self._constraint_term_names = self._infer_cost_term_names(self.env)
+        named_constraint_limits = self.alg_cfg_full.get("constraint_limits", None)
+        if isinstance(named_constraint_limits, dict):
+            # Support named per-constraint limits to avoid fragile order coupling.
+            default_limit = float(self.alg_cfg_full.get("cost_limit", 0.0))
+            if self._constraint_term_names is None:
+                ordered_names = sorted(str(name) for name in named_constraint_limits.keys())
+            else:
+                ordered_names = self._constraint_term_names
+            ordered_limits = [
+                float(named_constraint_limits.get(name, default_limit)) for name in ordered_names
+            ]
+            self.alg_cfg["constraint_limits"] = ordered_limits
+            self.alg_cfg_full["constraint_limits"] = ordered_limits
 
         alg_class_name = self.alg_cfg["class_name"]
         alg_spec = get_algorithm_spec(alg_class_name)
@@ -579,6 +623,12 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:  # noqa: C901
         """Custom logger to support cost metrics and robust key aggregation."""
+        def _log_scalar(tag: str, value: float, step: int):
+            self.writer.add_scalar(tag, value, step)
+            mirror_tag = self._key_curve_mirror_map.get(tag)
+            if mirror_tag is not None:
+                self.writer.add_scalar(mirror_tag, value, step)
+
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
@@ -609,36 +659,43 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 scalar = value.item() if torch.is_tensor(value) else float(value)
                 fmt = "{:.6f}" if abs(scalar) < 1.0e-3 else "{:.4f}"
                 if "/" in key:
-                    self.writer.add_scalar(key, scalar, locs["it"])
+                    _log_scalar(key, scalar, locs["it"])
                     ep_string += f"""{f"{key}:":>{pad}} {fmt.format(scalar)}\n"""
                 else:
-                    self.writer.add_scalar("Episode/" + key, scalar, locs["it"])
+                    _log_scalar("Episode/" + key, scalar, locs["it"])
                     ep_string += f"""{f"Mean episode {key}:":>{pad}} {fmt.format(scalar)}\n"""
 
         mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
+        cost_metrics = locs.get("cost_metrics")
 
         # Log losses
         for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+            _log_scalar(f"Loss/{key}", value, locs["it"])
+        if isinstance(cost_metrics, dict) and "base_step_size" in cost_metrics:
+            _log_scalar("Loss/learning_rate", float(cost_metrics["base_step_size"]), locs["it"])
+        else:
+            _log_scalar("Loss/learning_rate", float(self.alg.learning_rate), locs["it"])
+        if isinstance(cost_metrics, dict) and "step_size" in cost_metrics:
+            _log_scalar("Loss/effective_step_size", float(cost_metrics["step_size"]), locs["it"])
+        if isinstance(cost_metrics, dict) and "effective_step_ratio" in cost_metrics:
+            _log_scalar("Loss/effective_step_ratio", float(cost_metrics["effective_step_ratio"]), locs["it"])
 
         # Log optional cost metrics
         cost_string = ""
-        cost_metrics = locs.get("cost_metrics")
         if isinstance(cost_metrics, dict) and cost_metrics:
             for key, value in cost_metrics.items():
                 scalar = value.item() if torch.is_tensor(value) else float(value)
-                self.writer.add_scalar(f"Cost/{key}", scalar, locs["it"])
+                _log_scalar(f"Cost/{key}", scalar, locs["it"])
                 cost_string += f"""{f"Cost/{key}:":>{pad}} {scalar:.4f}\n"""
 
         # Log noise std
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        _log_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
         # Log performance
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+        _log_scalar("Perf/total_fps", fps, locs["it"])
+        _log_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+        _log_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
         # Log training
         if len(locs["rewbuffer"]) > 0:
@@ -652,10 +709,10 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 )
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # Everything else
-            self.writer.add_scalar(
+            _log_scalar(
                 "Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"]
             )
-            self.writer.add_scalar(
+            _log_scalar(
                 "Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"]
             )
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging

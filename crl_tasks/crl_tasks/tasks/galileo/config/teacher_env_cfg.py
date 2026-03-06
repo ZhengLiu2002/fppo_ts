@@ -68,7 +68,10 @@ class GalileoCRLSceneCfg(GalileoBaseSceneCfg):
 
 @configclass
 class GalileoTeacherCRLEnvCfg(CRLManagerBasedRLEnvCfg):
-    scene: GalileoCRLSceneCfg = GalileoCRLSceneCfg(num_envs=4096, env_spacing=1.0)
+    scene: GalileoCRLSceneCfg = GalileoCRLSceneCfg(
+        num_envs=GalileoDefaults.env.teacher_num_envs,
+        env_spacing=1.0,
+    )
     observations: TeacherObservationsCfg = TeacherObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
@@ -84,7 +87,7 @@ class GalileoTeacherCRLEnvCfg(CRLManagerBasedRLEnvCfg):
         self.decimation = GalileoDefaults.general.decimation
         self.episode_length_s = GalileoDefaults.general.episode_length_s
         self.sim.dt = GalileoDefaults.sim.dt
-        self.sim.render_interval = self.decimation
+        self.sim.render_interval = GalileoDefaults.general.render_interval
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
         self.sim.physx.gpu_found_lost_pairs_capacity = 10 * 1024 * 1024
@@ -107,7 +110,7 @@ class GalileoTeacherCRLEnvCfg_PLAY(GalileoTeacherCRLEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 32
+        self.scene.num_envs = GalileoDefaults.env.teacher_play_num_envs
         self.episode_length_s = 60.0
         self.scene.terrain.terrain_generator.curriculum = False
         self.scene.terrain.max_init_terrain_level = None
