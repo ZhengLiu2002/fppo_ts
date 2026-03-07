@@ -8,11 +8,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .omnisafe_utils import Lagrange
 from .ppo import PPO
 
 
 class PPOLagrange(PPO):
-    """PPO with Lagrangian penalty for CMDPs."""
+    """PPO with an OmniSafe-style Lagrange multiplier update for CMDPs."""
 
     def __init__(
         self,
@@ -35,16 +36,18 @@ class PPOLagrange(PPO):
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         normalize_cost_advantage: bool = False,
-        # Lagrange parameters
         cost_limit=0.0,
         lagrange_lr=1e-2,
         lagrange_max=100.0,
-        # NP3O-style positive-part violation shaping
+        lagrangian_multiplier_init: float = 0.0,
+        lagrange_optimizer: str = "Adam",
         cost_viol_loss_coef: float = 0.0,
         k_value: float = 1.0,
         k_growth: float = 1.0,
         k_max: float = 1.0,
-        # Distributed training parameters
+        k_decay: float = 1.0,
+        k_min: float = 0.0,
+        k_violation_threshold: float = 0.02,
         multi_gpu_cfg: dict | None = None,
     ):
         super().__init__(
@@ -72,14 +75,79 @@ class PPOLagrange(PPO):
             k_value=k_value,
             k_growth=k_growth,
             k_max=k_max,
+            k_decay=k_decay,
+            k_min=k_min,
+            k_violation_threshold=k_violation_threshold,
             multi_gpu_cfg=multi_gpu_cfg,
         )
-        self.lagrange_lr = lagrange_lr
-        self.lagrange_max = lagrange_max
-        self.lagrange_multiplier = torch.tensor(0.0, device=self.device)
+        self.lagrange_lr = float(lagrange_lr)
+        self.lagrange_max = float(lagrange_max)
+        self._lagrange = Lagrange(
+            cost_limit=float(cost_limit),
+            lagrangian_multiplier_init=float(lagrangian_multiplier_init),
+            lambda_lr=float(lagrange_lr),
+            lambda_optimizer=lagrange_optimizer,
+            lagrangian_upper_bound=float(lagrange_max) if lagrange_max is not None else None,
+            device=self.device,
+        )
         self.train_metrics: dict[str, float] = {}
 
+    @property
+    def lagrange_multiplier(self) -> torch.Tensor:
+        return self._lagrange.lagrangian_multiplier.detach()
+
+    def _estimate_rollout_cost(self) -> float:
+        if self.storage.cost_term_rewards is not None:
+            rollout_costs = self.storage.cost_term_rewards
+            if rollout_costs.ndim == 3:
+                rollout_costs = rollout_costs.sum(dim=-1)
+        else:
+            rollout_costs = self.storage.cost_rewards
+        rollout_costs = self._sanitize_tensor(
+            rollout_costs,
+            nan=0.0,
+            posinf=1.0e4,
+            neginf=0.0,
+            clamp=1.0e4,
+        )
+        return float(rollout_costs.sum(dim=0).mean().item())
+
+    def _combined_advantages(
+        self,
+        reward_advantages: torch.Tensor,
+        cost_advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        penalty = self._lagrange.lagrangian_multiplier.detach()
+        combined = (reward_advantages - penalty * cost_advantages) / (1.0 + penalty)
+        return self._sanitize_tensor(
+            combined,
+            nan=0.0,
+            posinf=1.0e3,
+            neginf=-1.0e3,
+            clamp=1.0e3,
+        )
+
+    def state_dict(self) -> dict:
+        return {
+            "lagrange": self._lagrange.state_dict(),
+            "learning_rate": self.learning_rate,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        if not state_dict:
+            return
+        lagrange_state = state_dict.get("lagrange")
+        if lagrange_state is not None:
+            self._lagrange.load_state_dict(lagrange_state)
+        learning_rate = state_dict.get("learning_rate")
+        if learning_rate is not None:
+            self.learning_rate = float(learning_rate)
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
+
     def update(self):  # noqa: C901
+        self._lagrange.update_lagrange_multiplier(self._estimate_rollout_cost())
+
         mean_value_loss = 0.0
         mean_cost_value_loss = 0.0
         mean_surrogate_loss = 0.0
@@ -87,8 +155,9 @@ class PPOLagrange(PPO):
         mean_viol_loss = 0.0
         mean_cost_return = 0.0
         mean_cost_violation = 0.0
+        mean_kl = 0.0
+        skipped_updates = 0
 
-        # generator for mini batches
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
@@ -129,15 +198,22 @@ class PPOLagrange(PPO):
                         cost_advantages_batch = (
                             cost_advantages_batch - cost_advantages_batch.mean()
                         ) / (cost_advantages_batch.std() + 1e-8)
+
+            returns_batch = self._sanitize_tensor(
+                returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
             cost_returns_batch = self._sanitize_tensor(
                 cost_returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
             )
-            cost_advantages_batch = self._sanitize_tensor(
-                cost_advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            target_values_batch = self._sanitize_tensor(
+                target_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
             )
             cost_values_batch = self._sanitize_tensor(
                 cost_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
             )
+            cost_term_returns_batch = extra_batch[0] if len(extra_batch) > 0 else None
+            cost_term_advantages_batch = extra_batch[1] if len(extra_batch) > 1 else None
+            cost_term_values_batch = extra_batch[3] if len(extra_batch) > 3 else None
             cost_terms_ret, cost_terms_adv, cost_terms_val = self._prepare_cost_term_batches(
                 cost_returns_batch=cost_returns_batch,
                 cost_advantages_batch=cost_advantages_batch,
@@ -148,7 +224,6 @@ class PPOLagrange(PPO):
             aggregate_cost_returns = torch.sum(cost_terms_ret, dim=1)
             aggregate_cost_advantages = torch.sum(cost_terms_adv, dim=1)
 
-            # Actor and critic forward pass
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(
@@ -169,44 +244,65 @@ class PPOLagrange(PPO):
             mu_batch = self.policy.action_mean
             sigma_batch = self.policy.action_std
             entropy_batch = self.policy.entropy
+            batch_cost_return, batch_cost_violation, c_hat = self._batch_cost_stats(
+                aggregate_cost_returns
+            )
 
-            # KL (adaptive schedule)
+            with torch.inference_mode():
+                kl = self._safe_kl(mu_batch, sigma_batch, old_mu_batch, old_sigma_batch)
+                kl_mean = self._all_reduce_mean(torch.mean(kl))
+
             if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        dim=-1,
-                    )
-                    kl_mean = torch.mean(kl)
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                if self.gpu_global_rank == 0:
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
 
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+            if torch.isfinite(kl_mean) and kl_mean.item() > self._kl_hard_limit():
+                if self.gpu_global_rank == 0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 2.0)
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+                mean_kl += kl_mean.item()
+                mean_cost_return += batch_cost_return.item()
+                mean_cost_violation += batch_cost_violation.item()
+                skipped_updates += 1
+                continue
+
+            ratio = self._safe_ratio(actions_log_prob_batch, old_actions_log_prob_batch)
+            combined_advantages = self._combined_advantages(
+                torch.squeeze(advantages_batch),
+                aggregate_cost_advantages,
+            )
+            surrogate = -combined_advantages * ratio
+            surrogate_clipped = -combined_advantages * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-            cost_surrogate = (aggregate_cost_advantages * ratio).mean()
-            batch_cost_return, batch_cost_violation, c_hat_batch = self._batch_cost_stats(
-                aggregate_cost_returns
+            ratio_cost = torch.clamp(
+                ratio,
+                1.0 - self.cost_ratio_clip,
+                1.0 + self.cost_ratio_clip,
             )
-            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat_batch)
+            cost_surrogate = (aggregate_cost_advantages * ratio_cost).mean()
+            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat)
+            surrogate_loss = self._sanitize_tensor(
+                surrogate_loss, nan=0.0, posinf=1.0e6, neginf=-1.0e6, clamp=1.0e6
+            )
+            viol_loss = self._sanitize_tensor(
+                viol_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -217,6 +313,9 @@ class PPOLagrange(PPO):
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
+            value_loss = self._sanitize_tensor(
+                value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             if self.use_clipped_value_loss:
                 cost_value_clipped = old_cost_terms + (
@@ -227,15 +326,22 @@ class PPOLagrange(PPO):
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
             else:
                 cost_value_loss = (cost_terms_ret - pred_cost_terms).pow(2).mean()
+            cost_value_loss = self._sanitize_tensor(
+                cost_value_loss, nan=0.0, posinf=1.0e6, neginf=0.0, clamp=1.0e6
+            )
 
             loss = (
                 surrogate_loss
-                + self.lagrange_multiplier * cost_surrogate
                 + viol_loss
                 + self.value_loss_coef * value_loss
                 + self.cost_value_loss_coef * cost_value_loss
                 - self.entropy_coef * entropy_batch.mean()
             )
+            loss = self._sanitize_tensor(
+                loss, nan=0.0, posinf=1.0e6, neginf=-1.0e6, clamp=1.0e6
+            )
+            if not torch.isfinite(loss):
+                continue
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -243,7 +349,7 @@ class PPOLagrange(PPO):
                 self.reduce_parameters()
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            self._step_constraint_scale()
+            self._step_constraint_scale(batch_cost_violation.item())
 
             mean_value_loss += value_loss.item()
             mean_cost_value_loss += cost_value_loss.item()
@@ -252,6 +358,7 @@ class PPOLagrange(PPO):
             mean_viol_loss += viol_loss.item()
             mean_cost_return += batch_cost_return.item()
             mean_cost_violation += batch_cost_violation.item()
+            mean_kl += kl_mean.item()
 
         mean_value_loss /= num_updates
         mean_cost_value_loss /= num_updates
@@ -260,32 +367,20 @@ class PPOLagrange(PPO):
         mean_viol_loss /= num_updates
         mean_cost_return /= num_updates
         mean_cost_violation /= num_updates
+        mean_kl /= num_updates
+        kl_skip_rate = skipped_updates / num_updates
 
-        cost_return_mean = torch.tensor(mean_cost_return, device=self.device)
-        cost_violation_mean = torch.tensor(mean_cost_violation, device=self.device)
-        if self.is_multi_gpu:
-            torch.distributed.all_reduce(cost_return_mean, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(cost_violation_mean, op=torch.distributed.ReduceOp.SUM)
-            cost_return_mean /= self.gpu_world_size
-            cost_violation_mean /= self.gpu_world_size
-        mean_cost_return = cost_return_mean.item()
-        mean_cost_violation = cost_violation_mean.item()
-        c_hat = mean_cost_return - self.cost_limit
-        with torch.no_grad():
-            self.lagrange_multiplier = torch.clamp(
-                self.lagrange_multiplier + self.lagrange_lr * c_hat, min=0.0, max=self.lagrange_max
-            )
-
+        self.storage.clear()
         self.train_metrics = {
             "mean_cost_return": mean_cost_return,
             "cost_limit_margin": self.cost_limit - mean_cost_return,
             "cost_violation_rate": mean_cost_violation,
             "viol_loss": mean_viol_loss,
             "k_value": self.k_value,
-            "lagrange_multiplier": self.lagrange_multiplier.item(),
+            "kl": mean_kl,
+            "kl_skip_rate": kl_skip_rate,
+            "lagrange_multiplier": float(self.lagrange_multiplier.item()),
         }
-
-        self.storage.clear()
 
         return {
             "value_function": mean_value_loss,

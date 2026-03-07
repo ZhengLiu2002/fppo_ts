@@ -142,6 +142,7 @@ register_algorithm(
         module="scripts.rsl_rl.algorithms.ppo_lagrange",
         class_name="PPOLagrange",
         training_type="rl",
+        aliases=("ppo_lag", "ppolag", "ppolagrange"),
     )
 )
 register_algorithm(
@@ -162,9 +163,9 @@ register_algorithm(
 )
 register_algorithm(
     AlgorithmSpec(
-        name="focpo",
-        module="scripts.rsl_rl.algorithms.focpo",
-        class_name="FOCPO",
+        name="focops",
+        module="scripts.rsl_rl.algorithms.focops",
+        class_name="FOCOPS",
         training_type="rl",
     )
 )

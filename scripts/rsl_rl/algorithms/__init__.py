@@ -3,26 +3,40 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Implementation of different RL agents."""
+"""Public algorithm namespace with lazy class resolution."""
 
 from .registry import (
     get_algorithm_class,
-    list_algorithm_names,
     list_algorithm_aliases,
+    list_algorithm_names,
     register_algorithm,
 )
 
-PPO = get_algorithm_class("ppo")
-FPPO = get_algorithm_class("fppo")
-NP3O = get_algorithm_class("np3o")
-PPOLagrange = get_algorithm_class("ppo_lagrange")
-CPO = get_algorithm_class("cpo")
-PCPO = get_algorithm_class("pcpo")
-FOCPO = get_algorithm_class("focpo")
-Distillation = get_algorithm_class("distillation")
+_ALGORITHM_EXPORTS = {
+    "PPO": "ppo",
+    "FPPO": "fppo",
+    "NP3O": "np3o",
+    "PPOLagrange": "ppo_lagrange",
+    "CPO": "cpo",
+    "PCPO": "pcpo",
+    "FOCOPS": "focops",
+    "Distillation": "distillation",
+}
 
-# Backward-compatible mapping (lower-case keys).
-ALGORITHM_REGISTRY = {name: get_algorithm_class(name) for name in list_algorithm_names()}
+
+def __getattr__(name: str):
+    if name == "ALGORITHM_REGISTRY":
+        value = {algo_name: get_algorithm_class(algo_name) for algo_name in list_algorithm_names()}
+        globals()[name] = value
+        return value
+
+    if name in _ALGORITHM_EXPORTS:
+        value = get_algorithm_class(_ALGORITHM_EXPORTS[name])
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "PPO",
@@ -31,7 +45,7 @@ __all__ = [
     "PPOLagrange",
     "CPO",
     "PCPO",
-    "FOCPO",
+    "FOCOPS",
     "Distillation",
     "ALGORITHM_REGISTRY",
     "get_algorithm_class",

@@ -11,8 +11,8 @@ import torch.nn as nn
 from .ppo_lagrange import PPOLagrange
 
 
-class FOCPO(PPOLagrange):
-    """First-order constrained policy optimization with KL regularization."""
+class FOCOPS(PPOLagrange):
+    """First-order constrained policy optimization ported from OmniSafe FOCOPS."""
 
     def __init__(
         self,
@@ -38,12 +38,17 @@ class FOCPO(PPOLagrange):
         cost_limit=0.0,
         lagrange_lr=1e-2,
         lagrange_max=100.0,
+        lagrangian_multiplier_init: float = 0.0,
+        lagrange_optimizer: str = "Adam",
+        focops_eta: float | None = None,
+        focops_lambda: float | None = None,
         cost_viol_loss_coef: float = 0.0,
         k_value: float = 1.0,
         k_growth: float = 1.0,
         k_max: float = 1.0,
-        focpo_eta=0.02,
-        focpo_lambda=1.0,
+        k_decay: float = 1.0,
+        k_min: float = 0.0,
+        k_violation_threshold: float = 0.02,
         multi_gpu_cfg: dict | None = None,
     ):
         super().__init__(
@@ -69,16 +74,23 @@ class FOCPO(PPOLagrange):
             cost_limit=cost_limit,
             lagrange_lr=lagrange_lr,
             lagrange_max=lagrange_max,
+            lagrangian_multiplier_init=lagrangian_multiplier_init,
+            lagrange_optimizer=lagrange_optimizer,
             cost_viol_loss_coef=cost_viol_loss_coef,
             k_value=k_value,
             k_growth=k_growth,
             k_max=k_max,
+            k_decay=k_decay,
+            k_min=k_min,
+            k_violation_threshold=k_violation_threshold,
             multi_gpu_cfg=multi_gpu_cfg,
         )
-        self.focpo_eta = focpo_eta
-        self.focpo_lambda = focpo_lambda
+        self.focops_eta = float(focops_eta) if focops_eta is not None else None
+        self.focops_lambda = max(float(focops_lambda) if focops_lambda is not None else 1.0, 1.0e-8)
 
     def update(self):  # noqa: C901
+        self._lagrange.update_lagrange_multiplier(self._estimate_rollout_cost())
+
         mean_value_loss = 0.0
         mean_cost_value_loss = 0.0
         mean_surrogate_loss = 0.0
@@ -128,11 +140,15 @@ class FOCPO(PPOLagrange):
                         cost_advantages_batch = (
                             cost_advantages_batch - cost_advantages_batch.mean()
                         ) / (cost_advantages_batch.std() + 1e-8)
+
+            returns_batch = self._sanitize_tensor(
+                returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
+            )
             cost_returns_batch = self._sanitize_tensor(
                 cost_returns_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
             )
-            cost_advantages_batch = self._sanitize_tensor(
-                cost_advantages_batch, nan=0.0, posinf=1.0e3, neginf=-1.0e3, clamp=1.0e3
+            target_values_batch = self._sanitize_tensor(
+                target_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
             )
             cost_values_batch = self._sanitize_tensor(
                 cost_values_batch, nan=0.0, posinf=1.0e4, neginf=-1.0e4, clamp=1.0e4
@@ -164,21 +180,44 @@ class FOCPO(PPOLagrange):
                 cost_value_batch = cost_value_batch.view(cost_value_batch.shape[0], -1)
             pred_cost_terms = self._match_cost_heads(cost_value_batch, cost_terms_ret.shape[1])
             old_cost_terms = self._match_cost_heads(cost_terms_val, cost_terms_ret.shape[1])
-            mu_batch = self.policy.action_mean
-            sigma_batch = self.policy.action_std
-            entropy_batch = self.policy.entropy
-
-            kl = torch.sum(
-                torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                / (2.0 * torch.square(sigma_batch))
-                - 0.5,
-                dim=-1,
+            mu_batch = self._sanitize_tensor(
+                self.policy.action_mean,
+                nan=0.0,
+                posinf=1.0e4,
+                neginf=-1.0e4,
+                clamp=1.0e4,
             )
-            kl_mean = torch.mean(kl)
-            if self.is_multi_gpu:
-                torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                kl_mean /= self.gpu_world_size
+            sigma_batch = self._sanitize_tensor(
+                self.policy.action_std,
+                nan=1.0e-6,
+                posinf=1.0e2,
+                neginf=1.0e-6,
+                clamp=1.0e2,
+            ).clamp_min(1.0e-6)
+            entropy_batch = self.policy.entropy
+            batch_cost_return, batch_cost_violation, c_hat = self._batch_cost_stats(
+                aggregate_cost_returns
+            )
+
+            old_mu_batch = self._sanitize_tensor(
+                old_mu_batch,
+                nan=0.0,
+                posinf=1.0e4,
+                neginf=-1.0e4,
+                clamp=1.0e4,
+            )
+            old_sigma_batch = self._sanitize_tensor(
+                old_sigma_batch,
+                nan=1.0e-6,
+                posinf=1.0e2,
+                neginf=1.0e-6,
+                clamp=1.0e2,
+            ).clamp_min(1.0e-6)
+            kl = torch.distributions.kl_divergence(
+                torch.distributions.Normal(old_mu_batch, old_sigma_batch),
+                torch.distributions.Normal(mu_batch, sigma_batch),
+            ).sum(dim=-1)
+            kl_mean = self._all_reduce_mean(kl.mean())
 
             if self.desired_kl is not None and self.schedule == "adaptive":
                 if self.gpu_global_rank == 0:
@@ -193,19 +232,17 @@ class FOCPO(PPOLagrange):
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.learning_rate
 
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            penalty = self.lagrange_multiplier
-            adv_combo = (advantages_batch - penalty * cost_advantages_batch) / (1.0 + penalty)
-            lambda_value = max(self.focpo_lambda, 1.0e-8)
-            loss_pi = kl - (1.0 / lambda_value) * torch.squeeze(ratio) * torch.squeeze(adv_combo)
-            if self.focpo_eta is not None:
-                loss_pi = loss_pi * (kl.detach() <= self.focpo_eta).float()
-            surrogate_loss = loss_pi.mean()
-            cost_surrogate = (aggregate_cost_advantages * ratio).mean()
-            batch_cost_return, batch_cost_violation, c_hat_batch = self._batch_cost_stats(
-                aggregate_cost_returns
+            ratio = self._safe_ratio(actions_log_prob_batch, old_actions_log_prob_batch)
+            adv_combo = self._combined_advantages(
+                torch.squeeze(advantages_batch),
+                aggregate_cost_advantages,
             )
-            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat_batch)
+            surrogate_terms = kl - ratio * adv_combo / self.focops_lambda
+            if self.focops_eta is not None:
+                surrogate_terms = surrogate_terms * (kl.detach() <= self.focops_eta).float()
+            surrogate_loss = surrogate_terms.mean()
+            cost_surrogate = (aggregate_cost_advantages * ratio).mean()
+            viol_loss = self._positive_cost_penalty(cost_surrogate, c_hat)
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -241,7 +278,7 @@ class FOCPO(PPOLagrange):
                 self.reduce_parameters()
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            self._step_constraint_scale()
+            self._step_constraint_scale(batch_cost_violation.item())
 
             mean_value_loss += value_loss.item()
             mean_cost_value_loss += cost_value_loss.item()
@@ -261,21 +298,7 @@ class FOCPO(PPOLagrange):
         mean_cost_violation /= num_updates
         mean_kl /= num_updates
 
-        cost_return_mean = torch.tensor(mean_cost_return, device=self.device)
-        cost_violation_mean = torch.tensor(mean_cost_violation, device=self.device)
-        if self.is_multi_gpu:
-            torch.distributed.all_reduce(cost_return_mean, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(cost_violation_mean, op=torch.distributed.ReduceOp.SUM)
-            cost_return_mean /= self.gpu_world_size
-            cost_violation_mean /= self.gpu_world_size
-        mean_cost_return = cost_return_mean.item()
-        mean_cost_violation = cost_violation_mean.item()
-        c_hat = mean_cost_return - self.cost_limit
-        with torch.no_grad():
-            self.lagrange_multiplier = torch.clamp(
-                self.lagrange_multiplier + self.lagrange_lr * c_hat, min=0.0, max=self.lagrange_max
-            )
-
+        self.storage.clear()
         self.train_metrics = {
             "mean_cost_return": mean_cost_return,
             "cost_limit_margin": self.cost_limit - mean_cost_return,
@@ -283,10 +306,8 @@ class FOCPO(PPOLagrange):
             "viol_loss": mean_viol_loss,
             "k_value": self.k_value,
             "kl": mean_kl,
-            "lagrange_multiplier": self.lagrange_multiplier.item(),
+            "lagrange_multiplier": float(self.lagrange_multiplier.item()),
         }
-
-        self.storage.clear()
 
         return {
             "value_function": mean_value_loss,
@@ -295,3 +316,4 @@ class FOCPO(PPOLagrange):
             "entropy": mean_entropy,
             "viol": mean_viol_loss,
         }
+

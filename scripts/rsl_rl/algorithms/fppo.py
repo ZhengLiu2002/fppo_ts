@@ -38,7 +38,6 @@ class FPPO(PPO):
         delta_kl: float | None = None,
         backtrack_coeff=0.5,
         max_corrections=10,
-        max_backtracks: int | None = None,
         projection_eps=1e-8,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
@@ -67,7 +66,7 @@ class FPPO(PPO):
         confidence_level: float = 0.05,
         softproj_max_iters: int = 40,
         softproj_tol: float = 1.0e-6,
-        constraint_limits: list[float] | tuple[float, ...] | dict[str, float] | None = None,
+        constraint_limits: list[float] | tuple[float, ...] | None = None,
         # Compatibility knobs from previous FPPO variants
         feasible_first: bool = True,
         feasible_first_coef: float = 1.0,
@@ -84,8 +83,6 @@ class FPPO(PPO):
         step_size_max: float = 2.0e-3,
         target_accept_rate: float = 0.75,
         step_size_cost_margin: float = 0.2,
-        effective_step_ratio_target: float = 0.25,
-        effective_step_ratio_floor: float = 0.08,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -125,9 +122,6 @@ class FPPO(PPO):
         self.epsilon_safe = float(epsilon_safe)
         self.delta_kl = float(delta_kl) if delta_kl is not None else None
         self.backtrack_coeff = float(backtrack_coeff)
-        # Backward-compatible alias used by older configs.
-        if max_backtracks is not None:
-            max_corrections = max_backtracks
         self.max_corrections = int(max_corrections)
         self.projection_eps = float(projection_eps)
         self.use_clipped_surrogate = bool(use_clipped_surrogate)
@@ -143,9 +137,6 @@ class FPPO(PPO):
         self.confidence_level = min(max(float(confidence_level), 1.0e-8), 1.0 - 1.0e-8)
         self.softproj_max_iters = max(int(softproj_max_iters), 1)
         self.softproj_tol = max(float(softproj_tol), 1.0e-12)
-        if isinstance(constraint_limits, dict):
-            # Keep deterministic ordering when users pass named limits directly.
-            constraint_limits = [constraint_limits[k] for k in sorted(constraint_limits.keys())]
         self.constraint_limits = (
             torch.as_tensor(constraint_limits, dtype=torch.float32)
             if constraint_limits is not None
@@ -160,8 +151,6 @@ class FPPO(PPO):
         self.step_size_max = float(step_size_max)
         self.target_accept_rate = float(target_accept_rate)
         self.step_size_cost_margin = float(step_size_cost_margin)
-        self.effective_step_ratio_target = float(effective_step_ratio_target)
-        self.effective_step_ratio_floor = float(effective_step_ratio_floor)
 
         # Keep these fields for compatibility with old configs.
         self.feasible_first = bool(feasible_first)
@@ -510,16 +499,9 @@ class FPPO(PPO):
         mean_active_constraints /= num_updates
         accept_rate = accepted_updates / max(1, num_updates)
         reject_rate = 1.0 - accept_rate
-        base_step_before_adapt = max(float(self.step_size), 1.0e-12)
-        mean_effective_step_ratio = float(mean_step_size / base_step_before_adapt)
-        self._adapt_step_size(
-            accept_rate=accept_rate,
-            mean_cost_margin=mean_cost_margin,
-            mean_effective_ratio=mean_effective_step_ratio,
-        )
+        self._adapt_step_size(accept_rate=accept_rate, mean_cost_margin=mean_cost_margin)
 
-        # Keep this field as the controllable base step-size for consistent logging semantics.
-        self.learning_rate = float(self.step_size)
+        self.learning_rate = mean_step_size
         self.train_metrics = {
             "mean_cost_return": mean_cost_return,
             "cost_limit_margin": mean_cost_margin,
@@ -527,7 +509,6 @@ class FPPO(PPO):
             "viol_loss": mean_viol_loss,
             "k_value": self.k_value,
             "step_size": mean_step_size,
-            "effective_step_ratio": mean_effective_step_ratio,
             "base_step_size": self.step_size,
             "accept_rate": accept_rate,
             "reject_rate": reject_rate,
@@ -756,23 +737,10 @@ class FPPO(PPO):
         kappa = math.sqrt(2.0 * math.log(1.0 / delta_i))
         return mu + kappa * torch.sqrt(var / denom)
 
-    def _adapt_step_size(
-        self,
-        accept_rate: float,
-        mean_cost_margin: float,
-        mean_effective_ratio: float,
-    ):
+    def _adapt_step_size(self, accept_rate: float, mean_cost_margin: float):
         if not self.step_size_adaptive:
             return
-        # If accepted updates rely on deep backtracking, lower the proposal scale.
-        if mean_effective_ratio < self.effective_step_ratio_floor:
-            self.step_size = max(self.step_size_min, self.step_size * self.step_size_down)
-            return
-        if (
-            mean_cost_margin > self.step_size_cost_margin
-            and accept_rate >= self.target_accept_rate
-            and mean_effective_ratio >= self.effective_step_ratio_target
-        ):
+        if mean_cost_margin > self.step_size_cost_margin and accept_rate >= self.target_accept_rate:
             self.step_size = min(self.step_size_max, self.step_size * self.step_size_up)
         elif mean_cost_margin < 0.0 or accept_rate < self.target_accept_rate * 0.5:
             self.step_size = max(self.step_size_min, self.step_size * self.step_size_down)

@@ -205,8 +205,7 @@ class GalileoDefaults:
     class general:
         decimation = 8
         episode_length_s = 20.0
-        # Keep rendering step in sync with control step by default.
-        render_interval = decimation
+        render_interval = 4
 
     class curriculum:
         # Command curriculum uses a gated progression policy:
@@ -221,26 +220,22 @@ class GalileoDefaults:
         command_terrain_gate_level = 2.0
         command_min_active_ratio = 0.12
         lin_tracking_error_threshold = 0.21
-        ang_tracking_error_threshold = 0.30
+        ang_tracking_error_threshold = 0.22
         lin_eval_min_command_speed = 0.20
-        ang_eval_min_command_speed = 0.10
-        ang_min_lin_x_level = 0.30
+        ang_eval_min_command_speed = 0.16
+        ang_min_lin_x_level = 0.50
 
     class sim:
         dt = 0.0025
 
     class env:
-        # Keep role-specific env counts centralized to avoid hard-coded duplication.
-        teacher_num_envs = 4096
-        student_num_envs = 1024
-        teacher_play_num_envs = 32
-        student_eval_num_envs = 128
-        student_play_num_envs = 16
+        num_envs = 4096
 
     class obs:
         """Actor/Critic 观测维度与布局（训练配置从这里读取）。"""
 
-        # 通用动作维度
+        # 通用环境/动作维度
+        num_envs = 4096
         num_actions = 12
 
         # Teacher / Student 的 actor-critic 观测维度（当前默认一致，后续可按需分化）
@@ -254,6 +249,13 @@ class GalileoDefaults:
             actor_num_priv_explicit = 5
             actor_num_priv_latent = 0
             actor_num_hist = 0
+            num_actor_obs = (
+                actor_num_prop
+                + actor_num_scan
+                + actor_num_priv_explicit
+                + actor_num_priv_latent
+                + actor_num_prop * actor_num_hist
+            )
 
             # Critic obs:
             # base_lin_vel*3 + base_ang_vel*3 + projected_gravity*3 + joint_pos*12 + joint_vel*12 + actions*12 + commands*3
@@ -263,6 +265,13 @@ class GalileoDefaults:
             critic_num_priv_explicit = 5
             critic_num_priv_latent = 0
             critic_num_hist = 0
+            num_critic_obs = (
+                critic_num_prop
+                + critic_num_scan
+                + critic_num_priv_explicit
+                + critic_num_priv_latent
+                + critic_num_prop * critic_num_hist
+            )
 
         class student:
             # Actor obs (同 teacher):
@@ -272,6 +281,13 @@ class GalileoDefaults:
             actor_num_priv_explicit = 0
             actor_num_priv_latent = 0
             actor_num_hist = 0
+            num_actor_obs = (
+                actor_num_prop
+                + actor_num_scan
+                + actor_num_priv_explicit
+                + actor_num_priv_latent
+                + actor_num_prop * actor_num_hist
+            )
 
             # Critic obs (同 teacher):
             # base_lin_vel*3 + base_ang_vel*3 + projected_gravity*3 + joint_pos*12 + joint_vel*12 + actions*12 + commands*3
@@ -281,6 +297,13 @@ class GalileoDefaults:
             critic_num_priv_explicit = 5
             critic_num_priv_latent = 0
             critic_num_hist = 0
+            num_critic_obs = (
+                critic_num_prop
+                + critic_num_scan
+                + critic_num_priv_explicit
+                + critic_num_priv_latent
+                + critic_num_prop * critic_num_hist
+            )
 
         # 观测历史相关（如需）
         obs_history_length = 5
@@ -313,17 +336,17 @@ class GalileoDefaults:
 
         # 默认配置（用于 CommandsCfg 的初始化，不在地形特定配置中）
         class default:
-            heading_command_prob: float = 0.2
+            heading_command_prob: float = 0.4
             standing_command_prob: float = 0.05
-            yaw_command_prob: float = 0.75
+            yaw_command_prob: float = 0.55
             lin_vel_x = (0.2, 0.55)
             lin_vel_y = (-0.1, 0.1)
             ang_vel_z = (-0.22, 0.22)
             heading = (-math.pi / 3, math.pi / 3)
             start_curriculum_lin_x = (0.2, 0.45)
-            start_curriculum_ang_z = (-0.18, 0.18)
+            start_curriculum_ang_z = (-0.12, 0.12)
             max_curriculum_lin_x = (0.45, 1.0)
-            max_curriculum_ang_z = (-0.55, 0.55)
+            max_curriculum_ang_z = (-0.45, 0.45)
 
         ranges = {
             "pyramid_stairs": dict(
@@ -409,18 +432,18 @@ class GalileoDefaults:
                 lin_vel_y=(-0.25, 0.25),
                 ang_vel_z=(-0.22, 0.22),
                 heading=(-math.pi / 3, math.pi / 3),
-                heading_command_prob=0.2,
-                yaw_command_prob=0.75,
+                heading_command_prob=0.4,
+                yaw_command_prob=0.55,
                 standing_command_prob=0.0,
                 start_curriculum_lin_x=(0.2, 0.5),
-                start_curriculum_ang_z=(-0.18, 0.18),
+                start_curriculum_ang_z=(-0.12, 0.12),
                 max_curriculum_lin_x=(0.8, 1.2),
-                max_curriculum_ang_z=(-0.55, 0.55),
+                max_curriculum_ang_z=(-0.45, 0.45),
             ),
         }
 
         resampling_time_range = (6.0, 6.0)
-        clips = dict(lin_vel_clip=0.1, ang_vel_clip=0.01)
+        clips = dict(lin_vel_clip=0.1, ang_vel_clip=0.02)
 
     class priv_obs_norm:
         """Normalization ranges for privileged observations."""
@@ -560,14 +583,14 @@ class GalileoDefaults:
             "fppo": dict(
                 cost_value_loss_coef=1.0,
                 desired_kl=0.01,
-                delta_kl=0.015,
-                step_size=4.0e-4,
+                delta_kl=0.01,
+                step_size=6.0e-4,
                 cost_gamma=None,
                 cost_lam=None,
                 delta_safe=0.03,
                 epsilon_safe=0.01,
                 backtrack_coeff=0.5,
-                max_corrections=12,
+                max_backtracks=10,
                 projection_eps=1e-6,
                 active_set_threshold=0.05,
                 confidence_level=0.05,
@@ -582,35 +605,23 @@ class GalileoDefaults:
                 constraint_proxy_delta=0.2,
                 constraint_agg_tau=0.5,
                 constraint_scale_by_gamma=True,
-                # Named per-constraint limits. Runner resolves these by term name
-                # to avoid fragile coupling to term ordering.
-                constraint_limits={
-                    "prob_joint_pos": 0.90,
-                    "prob_joint_vel": 0.95,
-                    "prob_joint_torque": 1.00,
-                    "prob_body_contact": 0.60,
-                    "prob_com_frame": 0.70,
-                    "prob_gait_pattern": 1.05,
-                    "orthogonal_velocity": 0.95,
-                    "contact_velocity": 0.75,
-                    "foot_clearance": 0.85,
-                    "foot_height_limit": 0.70,
-                    "symmetric": 0.95,
-                    "base_contact_force": 0.55,
-                },
                 use_preconditioner=True,
                 preconditioner_beta=0.999,
                 preconditioner_eps=1e-8,
+                feasible_first=True,
+                feasible_first_coef=0.5,
+                feasible_cost_margin=5e-4,
+                infeasible_improve_ratio=0.005,
+                infeasible_improve_abs=5e-4,
                 min_step_size=1e-7,
+                relax_cost_margin=0.2,
                 step_size_adaptive=True,
-                step_size_up=1.015,
-                step_size_down=0.6,
+                step_size_up=1.03,
+                step_size_down=0.7,
                 step_size_min=5.0e-5,
-                step_size_max=1.2e-3,
-                target_accept_rate=0.72,
+                step_size_max=2.0e-3,
+                target_accept_rate=0.7,
                 step_size_cost_margin=0.2,
-                effective_step_ratio_target=0.20,
-                effective_step_ratio_floor=0.06,
                 cost_viol_loss_coef=0.05,
                 k_value=0.1,
                 k_growth=1.00005,
@@ -619,6 +630,7 @@ class GalileoDefaults:
                 k_min=0.02,
                 k_violation_threshold=0.02,
                 dagger_update_freq=20,
+                priv_reg_coef_schedual=[0.0, 0.1, 2000.0, 3000.0],
             ),
             # NP3O
             "np3o": dict(
@@ -626,14 +638,14 @@ class GalileoDefaults:
                 learning_rate=2.5e-4,
                 schedule="adaptive",
                 desired_kl=0.007,
-                cost_limit=1.3,
+                cost_limit=1.6,
                 cost_gamma=None,
                 cost_lam=None,
                 normalize_cost_advantage=True,
-                cost_viol_loss_coef=0.35,
-                k_value=0.15,
-                k_growth=1.0004,
-                k_max=1.2,
+                cost_viol_loss_coef=0.12,
+                k_value=0.03,
+                k_growth=1.00007,
+                k_max=0.4,
                 k_decay=0.9999,
                 k_min=0.01,
                 k_violation_threshold=0.02,
